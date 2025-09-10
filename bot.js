@@ -1080,7 +1080,7 @@ async function processAccountInTab(context, accountLine, tabIndex) {
                 }
 
                 // **کلیدی: چک کردن timeout message**
-                if (bodyText.includes(`The connection to the server timed out.`)) {
+                if (bodyText.includes(`Can't connect to the server`)) {
                     logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected for ${email} - attempt ${timeoutRetryCount + 1}/${maxTimeoutRetries + 1}`);
                     
                     if (timeoutRetryCount < maxTimeoutRetries) {
@@ -1862,4 +1862,5 @@ async function processAccounts() {
 export {
     createNewProfile, processFakeAccountFirst, processAccountInTab, cleanupProfile, sleep, manageFingerprintQueue,
     initializeFingerprintManager
+
 };
