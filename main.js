@@ -463,10 +463,12 @@ class PSNInstance {
     async processAccountsInParallel(context, accounts) {
         logger.info(`🚀 Starting parallel processing of ${accounts.length} accounts...`);
 
-        // ✅ شروع همه اکانت‌ها به صورت موازی با تاخیر (مثل کد قدیمی)
-        const promises = accounts.map(async (account, index) => {
-            // تاخیر قبل از شروع هر اکانت (2-3 ثانیه)
-            // const startDelay = index * randomDelay(2000, 3000);
+        const abortController = new AbortController();
+        let shouldExitGlobal = false;
+        const completedResults = [];
+
+        // ✅ ایجاد promise برای هر اکانت
+        const accountPromises = accounts.map(async (account, index) => {
             const startDelay = index * randomDelay(2000, 4000);
 
             if (startDelay > 0) {
@@ -474,83 +476,135 @@ class PSNInstance {
                 await sleep(startDelay);
             }
 
+            // چک کردن abort signal قبل از شروع
+            if (abortController.signal.aborted) {
+                logger.info(`⏹️ Account ${account.email} aborted before processing`);
+                return { type: 'aborted', account, index };
+            }
+
             logger.info(`🚀 Starting account ${index + 1}: ${account.email}`);
 
             try {
                 const accountString = `${account.email}:${account.password}`;
-                const result = await processAccountInTab(context, accountString, index, accounts.length);
 
-                logger.info(`✅ Account ${index + 1} completed: ${account.email} → ${result.status}`);
+                // اضافه کردن abort signal به processAccountInTab
+                const result = await processAccountInTab(
+                    context,
+                    accountString,
+                    index,
+                    accounts.length,
+                    abortController.signal // پاس دادن signal
+                );
 
-                return {
+                const accountResult = {
                     id: account.id,
                     email: account.email,
                     password: account.password,
                     status: result.status,
-                    error: result.error || null,
+                    error: result.error || result.message || null,
                     responseTime: result.responseTime || 0,
                     screenshot: result.screenshot || null,
                     additionalInfo: result.additionalInfo || {},
-                    tabIndex: index
+                    tabIndex: index,
+                    shouldExit: result.shouldExit || false
+                };
+
+                return {
+                    type: result.shouldExit ? 'exit' : 'completed',
+                    result: accountResult,
+                    account,
+                    index
                 };
 
             } catch (accountError) {
-                logger.error(`❌ Error processing account ${account.email}: ${accountError.message}`);
+                if (accountError.name === 'AbortError') {
+                    logger.info(`⏹️ Account ${account.email} was aborted`);
+                    return { type: 'aborted', account, index };
+                }
 
+                logger.error(`❌ Error processing account ${account.email}: ${accountError.message}`);
                 return {
-                    id: account.id,
-                    email: account.email,
-                    password: account.password,
-                    status: 'server-error',
-                    error: accountError.message,
-                    responseTime: 0,
-                    tabIndex: index
+                    type: 'error',
+                    result: {
+                        id: account.id,
+                        email: account.email,
+                        password: account.password,
+                        status: 'server-error',
+                        error: accountError.message,
+                        responseTime: 0,
+                        tabIndex: index
+                    },
+                    account,
+                    index
                 };
             }
         });
 
-        logger.info(`⏳ Waiting for all ${accounts.length} accounts to complete...`);
+        // ✅ پردازش promises با race condition
+        const activePromises = [...accountPromises];
 
-        // انتظار برای تکمیل همه اکانت‌ها
-        const results = await Promise.allSettled(promises);
+        while (activePromises.length > 0 && !shouldExitGlobal) {
+            try {
+                const result = await Promise.race(activePromises);
 
-        // پردازش نتایج
-        const finalResults = [];
-        let successCount = 0;
-        let errorCount = 0;
-
-        results.forEach((result, index) => {
-            if (result.status === 'fulfilled') {
-                finalResults.push(result.value);
-                logger.info(`📊 Account ${index + 1}: ${result.value.email} → ${result.value.status}`);
-
-                if (result.value.status === 'error' || result.value.status === 'server-error') {
-                    errorCount++;
-                } else {
-                    successCount++;
+                // حذف promise تکمیل شده از لیست
+                const promiseIndex = activePromises.findIndex(p => p === accountPromises[result.index]);
+                if (promiseIndex > -1) {
+                    activePromises.splice(promiseIndex, 1);
                 }
-            } else {
-                logger.error(`❌ Account ${index + 1}: Promise failed - ${result.reason}`);
-                errorCount++;
 
-                // اضافه کردن نتیجه خطا
-                const account = accounts[index];
-                finalResults.push({
-                    id: account.id,
-                    email: account.email,
-                    password: account.password,
-                    status: 'server-error',
-                    error: result.reason?.message || 'Promise failed',
-                    responseTime: 0,
-                    tabIndex: index
-                });
+                // پردازش نتیجه
+                if (result.type === 'exit') {
+                    logger.warn(`🚨 Exit signal received from account ${result.result.email}. Aborting all processes...`);
+                    shouldExitGlobal = true;
+                    abortController.abort();
+                    completedResults.push(result.result);
+                    break;
+                } else if (result.type === 'completed') {
+                    logger.info(`✅ Account ${result.index + 1} completed: ${result.result.email} → ${result.result.status}`);
+                    completedResults.push(result.result);
+                } else if (result.type === 'error') {
+                    logger.error(`❌ Account ${result.index + 1} error: ${result.result.email}`);
+                    completedResults.push(result.result);
+                }
+                // aborted results را ignore می‌کنیم
+
+            } catch (error) {
+                logger.error(`❌ Unexpected error in promise race: ${error.message}`);
+                break;
             }
-        });
+        }
 
-        logger.info(`📈 Parallel processing summary: ${successCount} success, ${errorCount} errors`);
-        logger.info(`🎉 All parallel processing completed. Total results: ${finalResults.length}`);
+        // اگر exit شده، منتظر تکمیل promise های باقی‌مانده نمی‌مانیم
+        if (shouldExitGlobal) {
+            logger.warn(`🚨 Processing stopped due to exit condition. Processed ${completedResults.length} accounts.`);
 
-        return finalResults;
+            // کمی صبر کنیم تا abort signal به همه برسد
+            await sleep(1000);
+        } else {
+            logger.info(`⏳ Waiting for remaining ${activePromises.length} accounts...`);
+            // اگر exit نشده، منتظر بقیه می‌مانیم
+            const remainingResults = await Promise.allSettled(activePromises);
+
+            remainingResults.forEach((result, i) => {
+                if (result.status === 'fulfilled' && result.value.type === 'completed') {
+                    completedResults.push(result.value.result);
+                }
+            });
+        }
+
+        const successCount = completedResults.filter(r => !['error', 'server-error', 'timeout-error'].includes(r.status)).length;
+        const errorCount = completedResults.length - successCount;
+
+        logger.info(`📈 Final summary: ${successCount} success, ${errorCount} errors, Total: ${completedResults.length}`);
+
+        return {
+            results: completedResults,
+            exitTriggered: shouldExitGlobal,
+            totalProcessed: completedResults.length,
+            successCount,
+            errorCount
+        };
     }
 
     /**
