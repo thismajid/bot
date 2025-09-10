@@ -8,7 +8,7 @@ import { faker } from '@faker-js/faker';
 import path from "node:path";
 import { logger } from "./utils/logger.js";
 import axios from 'axios'
-
+import FingerprintManager from "./FingerprintManager.js"
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -401,15 +401,57 @@ async function loadCookies() {
     }
 }
 
-// ==================== Enhanced: Duplicate profile and update proxy ====================
+// ایجاد instance سراسری - باید بعد از تعریف client باشه
+let fingerprintManager = null;
+
+// تابع برای مقداردهی fingerprintManager
+function initializeFingerprintManager(kameleoClient) {
+    if (!fingerprintManager) {
+        fingerprintManager = new FingerprintManager(kameleoClient);
+    }
+    return fingerprintManager;
+}
+
+// تابع اصلاح شده برای انتخاب فینگرپرینت
+async function selectBalancedFingerprint() {
+    try {
+        // اطمینان از اینکه fingerprintManager مقداردهی شده
+        if (!fingerprintManager) {
+            fingerprintManager = initializeFingerprintManager(client);
+        }
+
+        const fingerprint = await fingerprintManager.getNextFingerprint();
+        return fingerprint;
+
+    } catch (err) {
+        console.log("❌ Error selecting balanced fingerprint:", err.message);
+
+        // Fallback به روش قدیمی
+        console.log("🔄 Falling back to random selection...");
+        const fingerprints = await client.fingerprint.searchFingerprints("desktop", "windows", "chrome");
+        const windowsFingerprints = fingerprints.filter(item => item.os.version === '10');
+        return windowsFingerprints[Math.floor(Math.random() * windowsFingerprints.length)];
+    }
+}
+
+// تابع اصلاح شده createNewProfile
 async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
     const maxRetries = 3;
 
     try {
         console.log("Creating new profile...");
 
-        const fingerprints = await client.fingerprint.searchFingerprints("desktop", "windows", "chrome", "139");
-        const fingerprint = fingerprints.filter(item => item.os.version === '10').sort(() => Math.random() - 0.5)[0]
+        // مقداردهی fingerprintManager اگر هنوز نشده
+        if (!fingerprintManager) {
+            fingerprintManager = initializeFingerprintManager(client);
+        }
+
+        // استفاده از سیستم متعادل برای انتخاب فینگرپرینت
+        const fingerprint = await selectBalancedFingerprint();
+
+        if (!fingerprint) {
+            throw new Error("No fingerprint available");
+        }
 
         const profileName = `Profile_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
 
@@ -417,7 +459,6 @@ async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
             fingerprintId: fingerprint.id,
             name: profileName,
             webRtc: { value: "block" },
-            // screen: { value: "off" },
             screen: { value: 'manual', extra: '1280x720' },
             fonts: 'off'
         };
@@ -450,11 +491,10 @@ async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
 
         const context = await chromium.launchPersistentContext("", {
             executablePath: pwBridgePath,
-            args: ['--window-size=1920,1080', `-target ${ws}`], // اختیاری برای کنترل اندازه پنجره
+            args: ['--window-size=1920,1080', `-target ${ws}`],
             viewport: { width: 1920, height: 1080 },
-            timeout: 25000, // Increased from 25000 to 45000
+            timeout: 25000,
             headless: true,
-            // Add additional options for stability
             chromiumSandbox: false,
             devtools: false
         });
@@ -473,7 +513,8 @@ async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
                 name: profileName
             },
             context,
-            proxy: proxy
+            proxy: proxy,
+            fingerprintId: fingerprint.id
         };
 
     } catch (err) {
@@ -494,7 +535,7 @@ async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
 
             if (retryCount < maxRetries) {
                 console.log(`🔄 Retrying profile creation (${retryCount + 1}/${maxRetries})...`);
-                await sleep(2500 * (retryCount + 1)); // Progressive delay
+                await sleep(2500 * (retryCount + 1));
                 return createNewProfile(proxy, cookies, retryCount + 1);
             }
         }
@@ -517,6 +558,35 @@ async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
         }
 
         throw err;
+    }
+}
+
+// اضافه کردن دستورات مدیریتی
+async function manageFingerprintQueue(command) {
+    // مقداردهی fingerprintManager
+    if (!fingerprintManager) {
+        fingerprintManager = initializeFingerprintManager(client);
+    }
+
+    switch (command) {
+        case 'stats':
+            await fingerprintManager.showStats();
+            break;
+
+        case 'balance':
+            await fingerprintManager.checkBalance();
+            break;
+
+        case 'reset':
+            await fingerprintManager.resetStats();
+            break;
+
+        case 'init':
+            await fingerprintManager.initializeQueue();
+            break;
+
+        default:
+            console.log("Available commands: stats, balance, reset, init");
     }
 }
 
@@ -1515,4 +1585,7 @@ async function processAccounts() {
 // });
 
 
-export { createNewProfile, processFakeAccountFirst, processAccountInTab, cleanupProfile, sleep };
+export {
+    createNewProfile, processFakeAccountFirst, processAccountInTab, cleanupProfile, sleep, manageFingerprintQueue,
+    initializeFingerprintManager
+};
