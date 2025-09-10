@@ -478,7 +478,7 @@ class PSNInstance {
 
             try {
                 const accountString = `${account.email}:${account.password}`;
-                const result = await processAccountInTab(context, accountString, index);
+                const result = await processAccountInTab(context, accountString, index, accounts.length);
 
                 logger.info(`✅ Account ${index + 1} completed: ${account.email} → ${result.status}`);
 
@@ -714,4 +714,5 @@ const instance = new PSNInstance();
 instance.start().catch((error) => {
     logger.error(`💥 Failed to start instance: ${error.message}`, error);
     process.exit(1);
+
 });
