@@ -428,8 +428,8 @@ async function selectBalancedFingerprint() {
 
         // Fallback به روش قدیمی
         console.log("🔄 Falling back to random selection...");
-        const fingerprints = await client.fingerprint.searchFingerprints("desktop", "windows", "chrome");
-        const windowsFingerprints = fingerprints.filter(item => item.os.version === '10');
+        const fingerprints = await client.fingerprint.searchFingerprints("desktop", "windows", "chrome", "139");
+        const windowsFingerprints = fingerprints.filter(item => item.os.version === '11');
         return windowsFingerprints[Math.floor(Math.random() * windowsFingerprints.length)];
     }
 }
@@ -1011,7 +1011,7 @@ async function processAccountInTab(context, accountLine, tabIndex, accountsCount
                 } else {
                     // اگر retry هست، صفحه رو رفرش کن
                     logger.info(`🔄 Tab ${tabIndex + 1}: Refreshing page due to timeout (retry ${timeoutRetryCount}/${maxTimeoutRetries})...`);
-                    
+
                     await page.reload({
                         waitUntil: "domcontentloaded",
                         timeout: 15000
@@ -1019,7 +1019,7 @@ async function processAccountInTab(context, accountLine, tabIndex, accountsCount
 
                     // Smart loading detection بعد از رفرش
                     const pageLoadedAfterRefresh = await waitForPageContent(page, 'Sign in to PlayStation', 25000, tabIndex + 1);
-                    
+
                     if (!pageLoadedAfterRefresh) {
                         throw new Error("Page did not load properly after refresh");
                     }
@@ -1080,28 +1080,20 @@ async function processAccountInTab(context, accountLine, tabIndex, accountsCount
                 }
 
                 // **کلیدی: چک کردن timeout message**
-                if ((bodyText.includes(`Can't connect to the server`) || bodyText.includes('device')) && accountsCount === tabIndex + 1) {
-                    logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected for ${email} - attempt ${timeoutRetryCount + 1}/${maxTimeoutRetries + 1}`);
-                    
-                    if (timeoutRetryCount < maxTimeoutRetries) {
-                        timeoutRetryCount++;
-                        logger.info(`🔄 Tab ${tabIndex + 1}: Will retry due to timeout...`);
-                        
-                        // تاخیر قبل از retry
-                        await sleep(2000 + randomDelay(1000, 2000));
-                        continue; // ادامه حلقه برای retry
-                    } else {
-                        logger.error(`❌ Tab ${tabIndex + 1}: Max timeout retries reached for ${email}`);
-                        finalResult = {
+                if ((bodyText.includes(`Can't connect to the server`) || bodyText.includes('device sent too many requests')) && accountsCount === tabIndex + 1) {
+                    logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected for ${email}`);
+
+                    return {
+                        shouldExit: true,
+                        result: {
                             email,
                             status: 'timeout-error',
                             responseTime: Date.now() - startTime,
                             tabIndex,
                             retryCount: timeoutRetryCount,
                             message: 'Max timeout retries exceeded'
-                        };
-                        break; // خروج از حلقه
-                    }
+                        }
+                    };
                 }
 
                 // ادامه کد فقط اگر bodyText موجود باشه...
@@ -1166,7 +1158,7 @@ async function processAccountInTab(context, accountLine, tabIndex, accountsCount
 
             } catch (retryErr) {
                 logger.error(`❌ Tab ${tabIndex + 1}: Error during retry ${timeoutRetryCount} for ${email}: ${retryErr.message}`);
-                
+
                 if (timeoutRetryCount >= maxTimeoutRetries) {
                     finalResult = {
                         email,
@@ -1188,7 +1180,7 @@ async function processAccountInTab(context, accountLine, tabIndex, accountsCount
 
     } catch (err) {
         logger.error(`❌ Tab ${tabIndex + 1}: Error processing ${accountLine}: ${err.message}`);
-        
+
         return {
             email: accountLine.split(':')[0],
             status: 'server-error',
@@ -1245,8 +1237,8 @@ async function waitForPageContent(page, targetText, maxWaitTime = 25000, tabNumb
 
             // چک کردن timeout message با evaluate هم
             const hasTimeoutMessage = await page.evaluate(() => {
-                return document.body && document.body.innerText && 
-                       document.body.innerText.includes('The connection to the server timed out.');
+                return document.body && document.body.innerText &&
+                    document.body.innerText.includes('The connection to the server timed out.');
             }).catch(() => false);
 
             if (hasTimeoutMessage) {
@@ -1546,7 +1538,7 @@ async function processAccountsBatch() {
 
         // **بهبود اصلی: پردازش parallel ولی با چک اولین اکانت**
         console.log("🚀 Processing accounts in parallel...");
-        
+
         const promises = accountBatch.map((accountLine, index) =>
             processAccountInTab(context, accountLine, index)
         );
@@ -1559,29 +1551,29 @@ async function processAccountsBatch() {
 
         if (firstAccountResult.status === 'fulfilled') {
             const firstResult = firstAccountResult.value;
-            
+
             console.log(`🔍 Checking first account result: ${firstResult.email} - Status: ${firstResult.status}`);
-            
+
             if (firstResult.status === 'server-error') {
                 console.log(`🚨 CRITICAL: First account encountered server error - stopping entire processing!`);
                 console.log(`📧 First account: ${firstResult.email}`);
                 console.log(`⏹️ Cancelling processing of remaining accounts in this batch`);
-                
+
                 shouldStopProcessing = true;
-                
+
                 // ارسال فوری نتیجه اولین اکانت به سرور
                 await sendResultsToServer([firstResult]);
-                
+
                 // حذف پروکسی مشکل‌دار
                 if (usedProxy) {
                     console.log(`❌ Removing problematic proxy due to first account server error: ${usedProxy.host}:${usedProxy.port}`);
                     await removeUsedWorkingProxy(usedProxy);
                 }
-                
+
                 // فقط اولین اکانت رو از فایل حذف می‌کنیم
                 await removeProcessedAccounts(1);
                 console.log(`⚠️ Only first account removed from file due to server error`);
-                
+
                 return false; // متوقف کردن کل پردازش
             } else {
                 console.log(`✅ First account processed successfully: ${firstResult.email} (${firstResult.status})`);
@@ -1590,9 +1582,9 @@ async function processAccountsBatch() {
             // اگر اولین اکانت با خطا مواجه شده
             console.log(`🚨 CRITICAL: First account failed with error - stopping entire processing!`);
             console.log(`❌ Error: ${firstAccountResult.reason}`);
-            
+
             shouldStopProcessing = true;
-            
+
             // ایجاد نتیجه خطا برای اولین اکانت
             const errorResult = {
                 email: accountBatch[0].split(':')[0],
@@ -1601,14 +1593,14 @@ async function processAccountsBatch() {
                 responseTime: 0,
                 tabIndex: 0
             };
-            
+
             await sendResultsToServer([errorResult]);
-            
+
             if (usedProxy) {
                 console.log(`❌ Removing problematic proxy due to first account error: ${usedProxy.host}:${usedProxy.port}`);
                 await removeUsedWorkingProxy(usedProxy);
             }
-            
+
             await removeProcessedAccounts(1);
             return false;
         }
@@ -1616,7 +1608,7 @@ async function processAccountsBatch() {
         // **اگر اولین اکانت موفق بود، ادامه پردازش نتایج**
         if (!shouldStopProcessing) {
             console.log(`✅ First account successful - processing all results...`);
-            
+
             // Process all results...
             let proxyIssueDetected = false;
             let serverErrorCount = 0;
@@ -1632,7 +1624,7 @@ async function processAccountsBatch() {
                     }
                 } else {
                     console.log(`Tab ${index + 1}: Failed - ${result.reason}`);
-                    
+
                     // ایجاد نتیجه برای اکانت‌های ناموفق
                     const failedResult = {
                         email: accountBatch[index].split(':')[0],
@@ -1714,13 +1706,13 @@ async function processAccountsBatch() {
 async function sendResultsToServer(results) {
     try {
         console.log(`📤 Sending ${results.length} results to server...`);
-        
+
         // اینجا کد ارسال به سرور رو بنویس
         // مثال:
         // await axios.post('http://your-server.com/api/results', { results });
-        
+
         console.log(`✅ Results sent to server successfully`);
-        
+
         // ذخیره محلی هم برای backup
         const timestamp = new Date().toISOString();
         const logEntry = {
@@ -1728,12 +1720,12 @@ async function sendResultsToServer(results) {
             results,
             count: results.length
         };
-        
+
         await fs.appendFile(RESULTS_FILE, JSON.stringify(logEntry) + '\n', 'utf8');
-        
+
     } catch (error) {
         console.log(`❌ Error sending results to server: ${error.message}`);
-        
+
         // در صورت خطا، حداقل محلی ذخیره کن
         const timestamp = new Date().toISOString();
         const logEntry = {
@@ -1742,7 +1734,7 @@ async function sendResultsToServer(results) {
             count: results.length,
             error: error.message
         };
-        
+
         await fs.appendFile(RESULTS_FILE, JSON.stringify(logEntry) + '\n', 'utf8');
     }
 }
@@ -1864,5 +1856,3 @@ export {
     initializeFingerprintManager
 
 };
-
-
