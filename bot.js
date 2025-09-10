@@ -918,7 +918,7 @@ async function processFakeAccountFirst(context) {
 }
 
 // ==================== Enhanced: processAccountInTab with Timeout Detection and Retry ====================
-async function processAccountInTab(context, accountLine, tabIndex) {
+async function processAccountInTab(context, accountLine, tabIndex, accountsCount) {
     let page = null;
     const maxRetries = 2;
     const maxTimeoutRetries = 2; // حداکثر تعداد retry برای timeout
@@ -1080,7 +1080,7 @@ async function processAccountInTab(context, accountLine, tabIndex) {
                 }
 
                 // **کلیدی: چک کردن timeout message**
-                if (bodyText.includes(`Can't connect to the server`)) {
+                if (bodyText.includes(`Can't connect to the server`) && accountsCount === tabIndex + 1) {
                     logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected for ${email} - attempt ${timeoutRetryCount + 1}/${maxTimeoutRetries + 1}`);
                     
                     if (timeoutRetryCount < maxTimeoutRetries) {
@@ -1864,3 +1864,4 @@ export {
     initializeFingerprintManager
 
 };
+
