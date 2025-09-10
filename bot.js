@@ -1080,7 +1080,7 @@ async function processAccountInTab(context, accountLine, tabIndex, accountsCount
                 }
 
                 // **کلیدی: چک کردن timeout message**
-                if (bodyText.includes(`Can't connect to the server`) && accountsCount === tabIndex + 1) {
+                if ((bodyText.includes(`Can't connect to the server`) || bodyText.includes('device')) && accountsCount === tabIndex + 1) {
                     logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected for ${email} - attempt ${timeoutRetryCount + 1}/${maxTimeoutRetries + 1}`);
                     
                     if (timeoutRetryCount < maxTimeoutRetries) {
@@ -1864,4 +1864,5 @@ export {
     initializeFingerprintManager
 
 };
+
 
