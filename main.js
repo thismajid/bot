@@ -1,27 +1,20 @@
-// main.js
 import { io } from "socket.io-client";
+import { logger } from "./utils/logger.js";
+import { config } from "./utils/config.js";
 import {
-    createNewProfile,
-    processFakeAccountFirst,
-    processAccountInTab,
-    cleanupProfile,
+    ProfileManager,
+    AccountProcessor,
+    ProxyManager,
+    HumanBehavior
+} from "./modules/index.js";
+import {
     initializeGlobalProfileManager,
     startPeriodicCleanup,
     showCurrentStats,
     globalBrowserManager
 } from "./bot.js";
-import { logger } from "./utils/logger.js";
-import { config } from "./utils/config.js";
 
-// Helper functions
-function randomDelay(min = 2000, max = 3000) {
-    return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
+// ==================== Main PSN Instance Class ====================
 class PSNInstance {
     constructor() {
         this.instanceId = config.INSTANCE_ID;
@@ -31,6 +24,7 @@ class PSNInstance {
         this.registered = false;
         this.isProcessing = false;
         this.workStartTime = null;
+        
         this.stats = {
             processed: 0,
             success: 0,
@@ -38,17 +32,17 @@ class PSNInstance {
             startTime: Date.now()
         };
 
-        // ✅ اضافه کردن آمار مرورگر
         this.browserStats = {
             profilesCreated: 0,
             profilesClosed: 0,
             browserErrors: 0
         };
+
+        this.profileManager = new ProfileManager(null, globalBrowserManager);
+        this.accountProcessor = new AccountProcessor(null);
     }
 
-    /**
-    * راه‌اندازی اتصال WebSocket
-    */
+    // ==================== Socket Management ====================
     initSocket() {
         logger.info(`🔄 Connecting to server: ${this.serverUrl}`);
 
@@ -64,18 +58,13 @@ class PSNInstance {
         this.setupSocketEvents();
     }
 
-    /**
-    * تنظیم event های WebSocket
-    */
     setupSocketEvents() {
-        // اتصال موفق
         this.socket.on("connect", () => {
             this.connected = true;
             logger.info(`✅ Connected to server as ${this.instanceId}`);
             this.registerInstance();
         });
 
-        // قطع اتصال
         this.socket.on("disconnect", (reason) => {
             this.connected = false;
             this.registered = false;
@@ -83,46 +72,40 @@ class PSNInstance {
             logger.warn(`❌ Disconnected: ${reason}`);
         });
 
-        // تایید ثبت نام
         this.socket.on("registration-confirmed", (data) => {
             this.registered = true;
             logger.info(`🎯 Registration confirmed: ${data.instanceData.instanceId}`);
-
-            // شروع فرآیند کار با تاخیر کوتاه
             setTimeout(() => this.processWorkFlow(), 2000);
         });
 
-        // خطای ثبت نام
         this.socket.on("registration-error", (data) => {
             logger.error(`❌ Registration failed: ${data.error}`);
             this.registered = false;
         });
 
-        // دریافت پروکسی
+        this._setupWorkflowEvents();
+        this._setupErrorEvents();
+    }
+
+    _setupWorkflowEvents() {
         this.socket.on("proxy-assigned", (proxyData) => {
             logger.debug(`📡 Proxy assigned event received`);
         });
 
-        // عدم وجود پروکسی
         this.socket.on("no-proxy-available", (data) => {
             logger.debug(`📡 No proxy available event received`);
         });
 
-        // دریافت اکانت‌ها
         this.socket.on("accounts-assigned", (accountsData) => {
             logger.debug(`📡 Accounts assigned event received`);
         });
 
-        // عدم وجود اکانت
         this.socket.on("no-accounts-available", (data) => {
             logger.debug(`📡 No accounts available event received`);
         });
 
-        // تایید دریافت نتایج
         this.socket.on("results-acknowledged", (data) => {
             logger.info(`✅ Results acknowledged: ${data.processed} accounts processed`);
-
-            // شروع فرآیند بعدی با تاخیر
             setTimeout(() => {
                 if (this.connected && this.registered && !this.isProcessing) {
                     this.processWorkFlow();
@@ -130,12 +113,12 @@ class PSNInstance {
             }, 3000);
         });
 
-        // heartbeat response
         this.socket.on("heartbeat-ack", (data) => {
             // logger.debug(`💓 Heartbeat acknowledged`);
         });
+    }
 
-        // خطاهای عمومی
+    _setupErrorEvents() {
         this.socket.on("error", (error) => {
             logger.error(`❌ Socket error: ${error.message || error}`);
         });
@@ -145,9 +128,7 @@ class PSNInstance {
         });
     }
 
-    /**
-    * ثبت نام instance در سرور
-    */
+    // ==================== Registration ====================
     registerInstance() {
         const registrationData = {
             instanceId: this.instanceId,
@@ -157,7 +138,7 @@ class PSNInstance {
                 nodeVersion: process.version,
                 memory: process.memoryUsage(),
                 pid: process.pid,
-                clusterId: globalBrowserManager.clusterId // ✅ اضافه کردن cluster ID
+                clusterId: globalBrowserManager.clusterId
             },
             capabilities: {
                 batchSize: config.BATCH_SIZE || 3,
@@ -170,15 +151,13 @@ class PSNInstance {
         this.socket.emit("register-instance", registrationData);
     }
 
-    /**
-    * درخواست پروکسی از سرور
-    */
+    // ==================== Resource Requests ====================
     async requestProxy() {
         logger.info('🔍 Requesting proxy from server...');
 
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
-                reject(new Error('Proxy request timeout after 30 seconds'));
+                reject(new Error('Proxy request timeout after 15 seconds'));
             }, 15000);
 
             this.socket.emit("request-proxy");
@@ -204,15 +183,12 @@ class PSNInstance {
         });
     }
 
-    /**
-    * درخواست اکانت‌ها از سرور
-    */
     async requestAccounts(batchSize = 3) {
         logger.info(`📋 Requesting ${batchSize} accounts from server...`);
 
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
-                reject(new Error('Accounts request timeout after 30 seconds'));
+                reject(new Error('Accounts request timeout after 15 seconds'));
             }, 15000);
 
             this.socket.emit("request-accounts", { batchSize });
@@ -238,9 +214,7 @@ class PSNInstance {
         });
     }
 
-    /**
-    * فرآیند کامل پردازش
-    */
+    // ==================== Main Workflow ====================
     async processWorkFlow() {
         if (this.isProcessing) {
             logger.info('⏸ Already processing, skipping workflow...');
@@ -261,291 +235,201 @@ class PSNInstance {
 
         try {
             logger.info('🚀 Starting new workflow...');
-
-            // ✅ نمایش آمار فعلی مرورگرها
-            const browserStats = await globalBrowserManager.getClusterStats();
-            logger.info(`📊 Current browser stats: ${browserStats.totalBrowsers}/${browserStats.maxBrowsers} (Cluster ${globalBrowserManager.clusterId})`);
-
-            this.sendHeartbeat('starting', {
-                message: 'Starting new workflow',
-                startedAt: this.workStartTime,
-                browserStats: browserStats
-            });
-
-            // مرحله 1: دریافت پروکسی
-            logger.info('🔍 Step 1: Requesting proxy...');
-            try {
-                proxy = await this.requestProxy();
-                logger.info(`✅ Step 1 completed: Proxy ${proxy.host}:${proxy.port} received`);
-            } catch (proxyError) {
-                logger.error(`❌ Step 1 failed: ${proxyError.message}`);
-
-                setTimeout(() => {
-                    if (this.connected && this.registered) {
-                        this.processWorkFlow();
-                    }
-                }, 15000);
-
-                return;
-            }
-
-            // مرحله 2: ایجاد پروفایل با پروکسی
-            logger.info('🔧 Step 2: Creating profile with proxy...');
-            try {
-                // ✅ استفاده از createNewProfile بهبود یافته
-                profileData = await createNewProfile(proxy, []);
-                const context = profileData.context;
-                const profile = profileData.profile;
-
-                // ✅ آپدیت آمار
-                this.browserStats.profilesCreated++;
-
-                logger.info('✅ Step 2 completed: Profile created successfully');
-                logger.info(`📊 Profile created by cluster ${globalBrowserManager.clusterId}: ${profile.name}`);
-
-                // ✅ نمایش آمار جدید
-                const updatedStats = await globalBrowserManager.getClusterStats();
-                logger.info(`📈 Updated browser stats: ${updatedStats.totalBrowsers}/${updatedStats.maxBrowsers}`);
-
-                this.sendHeartbeat('profile-created', {
-                    proxyHost: proxy.host,
-                    proxyPort: proxy.port,
-                    profileId: profile.id,
-                    clusterId: globalBrowserManager.clusterId,
-                    browserStats: updatedStats
-                });
-
-            } catch (profileError) {
-                logger.error(`❌ Step 2 failed: ${profileError.message}`);
-
-                // ✅ آپدیت آمار خطا
-                this.browserStats.browserErrors++;
-
-                // ✅ مدیریت خطاهای مرتبط با محدودیت مرورگر
-                if (profileError.message.includes('Concurrent browsers limit exceeded') ||
-                    profileError.message.includes('Global browser limit exceeded') ||
-                    profileError.message.includes('HTTP 402')) {
-
-                    logger.warn('🚫 Browser limit exceeded, waiting longer before retry...');
-
-                    this.socket.emit("release-proxy", {
-                        proxyId: proxy.id,
-                        error: profileError.message,
-                        success: false
-                    });
-
-                    // تاخیر بیشتر برای خطاهای محدودیت مرورگر
-                    setTimeout(() => {
-                        if (this.connected && this.registered) {
-                            this.processWorkFlow();
-                        }
-                    }, 30000); // 30 ثانیه تاخیر
-
-                    return;
-                }
-
-                this.socket.emit("release-proxy", {
-                    proxyId: proxy.id,
-                    error: profileError.message,
-                    success: false
-                });
-
-                throw profileError;
-            }
-
-            // مرحله 3: تست فیک اکانت
-            logger.info('🎭 Step 3: Testing fake account for warmup...');
-            try {
-                // await processFakeAccountFirst(profileData.context);
-                logger.info('✅ Step 3 completed: Fake account test successful');
-
-                this.sendHeartbeat('warmup-completed', {
-                    message: 'Fake account warmup completed'
-                });
-
-            } catch (fakeError) {
-                logger.error(`❌ Step 3 failed: ${fakeError.message}`);
-
-                if (fakeError.message.includes('PROXY_') ||
-                    fakeError.message.includes('CONNECTION_') ||
-                    fakeError.message.includes('CONTEXT_DESTROYED')) {
-
-                    logger.warn('🚫 Proxy seems problematic, releasing it...');
-                    this.socket.emit("release-proxy", {
-                        proxyId: proxy.id,
-                        error: fakeError.message,
-                        success: false
-                    });
-
-                    throw fakeError;
-                }
-
-                logger.warn('⚠️ Fake account failed but continuing with real accounts...');
-            }
-
-            // مرحله 4: دریافت اکانت‌های واقعی
-            logger.info('📋 Step 4: Requesting real accounts...');
-            try {
-                accountsData = await this.requestAccounts(3);
-                accounts = accountsData.accounts;
-                logger.info(`✅ Step 4 completed: ${accounts.length} accounts received`);
-
-                this.sendHeartbeat('accounts-received', {
-                    accountCount: accounts.length,
-                    batchId: accountsData.batchId
-                });
-
-            } catch (accountsError) {
-                logger.error(`❌ Step 4 failed: ${accountsError.message}`);
-
-                setTimeout(() => {
-                    if (this.connected && this.registered) {
-                        this.processWorkFlow();
-                    }
-                }, 15000);
-
-                return;
-            }
-
-            // مرحله 5: پردازش اکانت‌های واقعی
-            logger.info('🚀 Step 5: Processing real accounts in parallel...');
-            this.sendHeartbeat('processing', {
-                accountCount: accounts.length,
-                batchId: accountsData.batchId,
-                startedAt: Date.now()
-            });
-
-            const results = await this.processAccountsInParallel(profileData.context, accounts);
-            logger.info(`✅ Step 5 completed: ${results.length} results generated`);
-
-            // آپدیت آمار محلی
-            results?.finalResults?.forEach(result => {
-                this.stats.processed++;
-                if (result.status === 'good') {
-                    this.stats.success++;
-                } else {
-                    this.stats.errors++;
-                }
-            });
-
-            // مرحله 6: ارسال نتایج
-            logger.info('📊 Step 6: Submitting results to server...');
-            await this.submitResults(results?.finalResults, proxy, accountsData.batchId);
-            logger.info('✅ Step 6 completed: Results submitted successfully');
-
-            // مرحله 7: پاک‌سازی
-            logger.info('🧹 Step 7: Cleaning up resources...');
-
-            // ✅ استفاده از closeProfile بهبود یافته
-            await this.closeProfileSafely(profileData);
-
-            logger.info('✅ Step 7 completed: Cleanup successful');
-            logger.info('🎉 Workflow completed successfully!');
-
+            await this._executeWorkflowSteps(proxy, profileData, accounts, accountsData);
+            
         } catch (error) {
             logger.error(`❌ Workflow error: ${error.message}`);
+            await this._handleWorkflowError(error, profileData, proxy, accounts);
+            
+        } finally {
+            this.isProcessing = false;
+            await this._finalizeWorkflow();
+        }
+    }
 
-            // ✅ آپدیت آمار خطا
-            this.browserStats.browserErrors++;
+    async _executeWorkflowSteps(proxy, profileData, accounts, accountsData) {
+        // Step 1: Get Browser Stats
+        const browserStats = await globalBrowserManager.getClusterStats();
+        logger.info(`📊 Current browser stats: ${browserStats.totalBrowsers}/${browserStats.maxBrowsers} (Cluster ${globalBrowserManager.clusterId})`);
 
-            this.reportError(error, {
-                step: 'workflow',
-                proxy: proxy ? `${proxy.host}:${proxy.port}` : null,
-                accountCount: accounts.length,
-                clusterId: globalBrowserManager.clusterId
-            });
+        this.sendHeartbeat('starting', {
+            message: 'Starting new workflow',
+            startedAt: this.workStartTime,
+            browserStats: browserStats
+        });
 
-            // پاک‌سازی در صورت خطا
-            if (profileData) {
-                await this.closeProfileSafely(profileData);
-            }
+        // Step 2: Request Proxy
+        proxy = await this._requestProxyStep();
+        if (!proxy) return;
 
-            // آزادسازی منابع در صورت خطا
-            if (accounts.length > 0) {
-                logger.info('🔓 Releasing locked accounts due to error...');
-                this.socket.emit("release-accounts", {
-                    accountIds: accounts.map(a => a.id),
-                    reason: 'workflow_error'
-                });
-            }
+        // Step 3: Create Profile
+        profileData = await this._createProfileStep(proxy);
+        if (!profileData) return;
 
-            if (proxy) {
-                logger.info('🔓 Releasing proxy due to error...');
-                this.socket.emit("release-proxy", {
-                    proxyId: proxy.id,
-                    error: error.message,
-                    success: false
-                });
-            }
+        // Step 4: Warmup (optional)
+        await this._warmupStep(profileData);
 
-            // ✅ تاخیر متغیر بر اساس نوع خطا
-            let retryDelay = 10000; // پیش‌فرض 10 ثانیه
+        // Step 5: Request Accounts
+        accountsData = await this._requestAccountsStep();
+        if (!accountsData) return;
+        accounts = accountsData.accounts;
 
-            if (error.message.includes('Concurrent browsers limit exceeded') ||
-                error.message.includes('Global browser limit exceeded') ||
-                error.message.includes('HTTP 402')) {
-                retryDelay = 30000; // 30 ثانیه برای خطاهای محدودیت مرورگر
-                logger.warn(`🚫 Browser limit error, waiting ${retryDelay / 1000} seconds before retry...`);
-            }
+        // Step 6: Process Accounts
+        const results = await this._processAccountsStep(profileData.context, accounts, accountsData);
 
+        // Step 7: Submit Results
+        await this._submitResultsStep(results?.finalResults, proxy, accountsData.batchId);
+
+        // Step 8: Cleanup
+        await this._cleanupStep(profileData);
+
+        logger.info('🎉 Workflow completed successfully!');
+    }
+
+    async _requestProxyStep() {
+        logger.info('🔍 Step 1: Requesting proxy...');
+        try {
+            const proxy = await this.requestProxy();
+            logger.info(`✅ Step 1 completed: Proxy ${proxy.host}:${proxy.port} received`);
+            return proxy;
+        } catch (proxyError) {
+            logger.error(`❌ Step 1 failed: ${proxyError.message}`);
             setTimeout(() => {
                 if (this.connected && this.registered) {
                     this.processWorkFlow();
                 }
-            }, retryDelay);
-
-        } finally {
-            this.isProcessing = false;
-
-            // ✅ ارسال آمار نهایی
-            const finalStats = await globalBrowserManager.getClusterStats();
-            this.sendHeartbeat('idle', {
-                message: 'Workflow completed, back to idle',
-                browserStats: finalStats,
-                instanceBrowserStats: this.browserStats
-            });
+            }, 15000);
+            return null;
         }
     }
 
-    /**
-    * ✅ متد جدید برای بستن امن پروفایل
-    */
-    async closeProfileSafely(profileData) {
+    async _createProfileStep(proxy) {
+        logger.info('🔧 Step 2: Creating profile with proxy...');
         try {
-            if (profileData && profileData.context) {
-                await profileData.context.close();
-            }
-
-            if (profileData && profileData.profile) {
-                await cleanupProfile(profileData.profile);
-            }
-
-            // ✅ کاهش شمارنده گلوبال
-            if (profileData && profileData.globalManager) {
-                await profileData.globalManager.decrementBrowserCount();
-                await profileData.globalManager.unregisterProfile(profileData.profile.id);
-            }
-
-            // ✅ آپدیت آمار
-            this.browserStats.profilesClosed++;
+            const profileData = await this.profileManager.createProfile(proxy, []);
+            
+            this.browserStats.profilesCreated++;
+            
+            logger.info('✅ Step 2 completed: Profile created successfully');
+            logger.info(`📊 Profile created by cluster ${globalBrowserManager.clusterId}: ${profileData.profile.name}`);
 
             const updatedStats = await globalBrowserManager.getClusterStats();
-            logger.info(`📉 Profile closed. Global browsers: ${updatedStats.totalBrowsers}/${updatedStats.maxBrowsers}`);
+            logger.info(`📈 Updated browser stats: ${updatedStats.totalBrowsers}/${updatedStats.maxBrowsers}`);
 
-        } catch (cleanupError) {
-            logger.error(`❌ Profile cleanup error: ${cleanupError.message}`);
+            this.sendHeartbeat('profile-created', {
+                proxyHost: proxy.host,
+                proxyPort: proxy.port,
+                profileId: profileData.profile.id,
+                clusterId: globalBrowserManager.clusterId,
+                browserStats: updatedStats
+            });
+
+            return profileData;
+
+        } catch (profileError) {
+            logger.error(`❌ Step 2 failed: ${profileError.message}`);
             this.browserStats.browserErrors++;
 
-            // حتی در صورت خطا، شمارنده را کاهش دهید
-            if (profileData && profileData.globalManager) {
-                await profileData.globalManager.decrementBrowserCount();
+            if (this._isBrowserLimitError(profileError)) {
+                logger.warn('🚫 Browser limit exceeded, waiting longer before retry...');
+                this._releaseProxy(proxy, profileError.message);
+                setTimeout(() => {
+                    if (this.connected && this.registered) {
+                        this.processWorkFlow();
+                    }
+                }, 30000);
+                return null;
             }
+
+            this._releaseProxy(proxy, profileError.message);
+            throw profileError;
         }
     }
 
-    /**
-    * پردازش موازی اکانت‌ها با تاخیر (مثل کد قدیمی)
-    */
+    async _warmupStep(profileData) {
+        logger.info('🎭 Step 3: Testing fake account for warmup...');
+        try {
+            // await this.accountProcessor.processFakeAccount(profileData.context);
+            logger.info('✅ Step 3 completed: Fake account test successful');
+
+            this.sendHeartbeat('warmup-completed', {
+                message: 'Fake account warmup completed'
+            });
+
+        } catch (fakeError) {
+            logger.error(`❌ Step 3 failed: ${fakeError.message}`);
+
+            if (AccountProcessor.isCriticalError(fakeError)) {
+                logger.warn('🚫 Proxy seems problematic, releasing it...');
+                throw fakeError;
+            }
+
+            logger.warn('⚠️ Fake account failed but continuing with real accounts...');
+        }
+    }
+
+    async _requestAccountsStep() {
+        logger.info('📋 Step 4: Requesting real accounts...');
+        try {
+            const accountsData = await this.requestAccounts(3);
+            logger.info(`✅ Step 4 completed: ${accountsData.accounts.length} accounts received`);
+
+            this.sendHeartbeat('accounts-received', {
+                accountCount: accountsData.accounts.length,
+                batchId: accountsData.batchId
+            });
+
+            return accountsData;
+
+        } catch (accountsError) {
+            logger.error(`❌ Step 4 failed: ${accountsError.message}`);
+            setTimeout(() => {
+                if (this.connected && this.registered) {
+                    this.processWorkFlow();
+                }
+            }, 15000);
+            return null;
+        }
+    }
+
+    async _processAccountsStep(context, accounts, accountsData) {
+        logger.info('🚀 Step 5: Processing real accounts in parallel...');
+        
+        this.sendHeartbeat('processing', {
+            accountCount: accounts.length,
+            batchId: accountsData.batchId,
+            startedAt: Date.now()
+        });
+
+        const results = await this.processAccountsInParallel(context, accounts);
+        logger.info(`✅ Step 5 completed: ${results.length} results generated`);
+
+        // Update local stats
+        results?.finalResults?.forEach(result => {
+            this.stats.processed++;
+            if (result.status === 'good') {
+                this.stats.success++;
+            } else {
+                this.stats.errors++;
+            }
+        });
+
+        return results;
+    }
+
+    async _submitResultsStep(results, proxy, batchId) {
+        logger.info('📊 Step 6: Submitting results to server...');
+        await this.submitResults(results, proxy, batchId);
+        logger.info('✅ Step 6 completed: Results submitted successfully');
+    }
+
+    async _cleanupStep(profileData) {
+        logger.info('🧹 Step 7: Cleaning up resources...');
+        await this.closeProfileSafely(profileData);
+        logger.info('✅ Step 7 completed: Cleanup successful');
+    }
+
+    // ==================== Account Processing ====================
     async processAccountsInParallel(context, accounts) {
         logger.info(`🚀 Starting parallel processing of ${accounts.length} accounts...`);
 
@@ -554,29 +438,27 @@ class PSNInstance {
         const completedResults = [];
 
         const accountPromises = accounts.map(async (account, index) => {
-            const startDelay = index * randomDelay(2000, 4000);
+            const startDelay = index * HumanBehavior.randomDelay(2000, 4000);
 
             if (startDelay > 0) {
                 logger.info(`⏳ Account ${account.email} waiting ${startDelay}ms before start...`);
-                await sleep(startDelay);
+                await HumanBehavior.sleep(startDelay);
             }
 
             if (abortController.signal.aborted) {
                 logger.info(`⏹️ Account ${account.email} aborted before processing`);
-                return [{ type: 'aborted', account, index }];
+                return { type: 'aborted', account, index };
             }
 
             logger.info(`🚀 Starting account ${index + 1}: ${account.email}`);
 
             try {
                 const accountString = `${account.email}:${account.password}`;
-
-                const result = await processAccountInTab(
+                const result = await this.accountProcessor.processAccount(
                     context,
                     accountString,
                     index,
-                    accounts.length,
-                    abortController.signal
+                    accounts.length
                 );
 
                 const accountResult = {
@@ -623,13 +505,13 @@ class PSNInstance {
             }
         });
 
+        // Process results as they complete
         const activePromises = [...accountPromises];
-
         while (activePromises.length > 0 && !shouldExitGlobal) {
             try {
                 const result = await Promise.race(activePromises);
-
                 const promiseIndex = activePromises.findIndex(p => p === accountPromises[result.index]);
+                
                 if (promiseIndex > -1) {
                     activePromises.splice(promiseIndex, 1);
                 }
@@ -654,14 +536,15 @@ class PSNInstance {
             }
         }
 
+        // Handle remaining promises
         if (shouldExitGlobal) {
             logger.warn(`🚨 Processing stopped due to exit condition. Processed ${completedResults.length} accounts.`);
-            await sleep(1000);
+            await HumanBehavior.sleep(1000);
         } else {
             logger.info(`⏳ Waiting for remaining ${activePromises.length} accounts...`);
             const remainingResults = await Promise.allSettled(activePromises);
 
-            remainingResults.forEach((result, i) => {
+            remainingResults.forEach((result) => {
                 if (result.status === 'fulfilled' && result.value.type === 'completed') {
                     completedResults.push(result.value.result);
                 }
@@ -682,9 +565,33 @@ class PSNInstance {
         };
     }
 
-    /**
-    * ارسال نتایج به سرور
-    */
+    // ==================== Profile Management ====================
+    async closeProfileSafely(profileData) {
+        try {
+            if (profileData && profileData.context) {
+                await profileData.context.close();
+            }
+
+            if (profileData && profileData.profile) {
+                await this.profileManager.closeProfile(profileData);
+            }
+
+            this.browserStats.profilesClosed++;
+
+            const updatedStats = await globalBrowserManager.getClusterStats();
+            logger.info(`📉 Profile closed. Global browsers: ${updatedStats.totalBrowsers}/${updatedStats.maxBrowsers}`);
+
+        } catch (cleanupError) {
+            logger.error(`❌ Profile cleanup error: ${cleanupError.message}`);
+            this.browserStats.browserErrors++;
+
+            if (profileData && profileData.globalManager) {
+                await profileData.globalManager.decrementBrowserCount();
+            }
+        }
+    }
+
+    // ==================== Results Management ====================
     async submitResults(results, proxy, batchId) {
         const processingTime = Date.now() - this.workStartTime;
 
@@ -702,8 +609,8 @@ class PSNInstance {
                 startTime: this.workStartTime,
                 endTime: Date.now(),
                 instanceStats: this.getStats(),
-                browserStats: this.browserStats, // ✅ اضافه کردن آمار مرورگر
-                clusterId: globalBrowserManager.clusterId // ✅ اضافه کردن cluster ID
+                browserStats: this.browserStats,
+                clusterId: globalBrowserManager.clusterId
             }
         };
 
@@ -725,25 +632,20 @@ class PSNInstance {
         });
     }
 
-    /**
-    * ارسال heartbeat به سرور
-    */
+    // ==================== Utility Methods ====================
     sendHeartbeat(status = 'idle', currentBatch = null) {
         if (this.connected && this.registered) {
             this.socket.emit("heartbeat", {
                 status: status,
                 currentBatch: currentBatch,
                 stats: this.getStats(),
-                browserStats: this.browserStats, // ✅ اضافه کردن آمار مرورگر
-                clusterId: globalBrowserManager.clusterId, // ✅ اضافه کردن cluster ID
+                browserStats: this.browserStats,
+                clusterId: globalBrowserManager.clusterId,
                 timestamp: Date.now()
             });
         }
     }
 
-    /**
-    * گزارش خطا به سرور
-    */
     reportError(error, context = {}) {
         if (this.connected && this.registered) {
             this.socket.emit("error-report", {
@@ -752,7 +654,7 @@ class PSNInstance {
                 stack: error.stack,
                 context: {
                     ...context,
-                    clusterId: globalBrowserManager.clusterId, // ✅ اضافه کردن cluster ID
+                    clusterId: globalBrowserManager.clusterId,
                     browserStats: this.browserStats
                 },
                 instanceId: this.instanceId,
@@ -763,9 +665,6 @@ class PSNInstance {
         logger.error(`🚨 Error reported: ${error.message}`, { context });
     }
 
-    /**
-    * دریافت آمار instance
-    */
     getStats() {
         const uptime = Date.now() - this.stats.startTime;
         return {
@@ -778,23 +677,81 @@ class PSNInstance {
             isProcessing: this.isProcessing,
             connected: this.connected,
             registered: this.registered,
-            browserStats: this.browserStats, // ✅ اضافه کردن آمار مرورگر
-            clusterId: globalBrowserManager.clusterId // ✅ اضافه کردن cluster ID
+            browserStats: this.browserStats,
+            clusterId: globalBrowserManager.clusterId
         };
     }
 
-    /**
-    * شروع heartbeat دوره‌ای
-    */
+    // ==================== Error Handling ====================
+    async _handleWorkflowError(error, profileData, proxy, accounts) {
+        this.browserStats.browserErrors++;
+
+        this.reportError(error, {
+            step: 'workflow',
+            proxy: proxy ? `${proxy.host}:${proxy.port}` : null,
+            accountCount: accounts.length,
+            clusterId: globalBrowserManager.clusterId
+        });
+
+        if (profileData) {
+            await this.closeProfileSafely(profileData);
+        }
+
+        if (accounts.length > 0) {
+            logger.info('🔓 Releasing locked accounts due to error...');
+            this.socket.emit("release-accounts", {
+                accountIds: accounts.map(a => a.id),
+                reason: 'workflow_error'
+            });
+        }
+
+        if (proxy) {
+            this._releaseProxy(proxy, error.message);
+        }
+
+        const retryDelay = this._isBrowserLimitError(error) ? 30000 : 10000;
+        
+        if (this._isBrowserLimitError(error)) {
+            logger.warn(`🚫 Browser limit error, waiting ${retryDelay / 1000} seconds before retry...`);
+        }
+
+        setTimeout(() => {
+            if (this.connected && this.registered) {
+                this.processWorkFlow();
+            }
+        }, retryDelay);
+    }
+
+    async _finalizeWorkflow() {
+        const finalStats = await globalBrowserManager.getClusterStats();
+        this.sendHeartbeat('idle', {
+            message: 'Workflow completed, back to idle',
+            browserStats: finalStats,
+            instanceBrowserStats: this.browserStats
+        });
+    }
+
+    _isBrowserLimitError(error) {
+        return error.message.includes('Concurrent browsers limit exceeded') ||
+               error.message.includes('Global browser limit exceeded') ||
+               error.message.includes('HTTP 402');
+    }
+
+    _releaseProxy(proxy, errorMessage) {
+        this.socket.emit("release-proxy", {
+            proxyId: proxy.id,
+            error: errorMessage,
+            success: false
+        });
+    }
+
+    // ==================== Lifecycle Management ====================
     startHeartbeat() {
         setInterval(() => {
             this.sendHeartbeat();
         }, config.HEARTBEAT_INTERVAL || 5000);
     }
 
-    /**
-    * ✅ شروع نمایش آمار دوره‌ای
-    */
     startStatsDisplay() {
         setInterval(async () => {
             try {
@@ -803,51 +760,34 @@ class PSNInstance {
             } catch (error) {
                 logger.error('Error displaying stats:', error.message);
             }
-        }, 60000); // هر دقیقه
+        }, 60000);
     }
 
-    /**
-    * راه‌اندازی instance
-    */
     async start() {
         logger.info(`🚀 Starting PSN Instance: ${this.instanceId}`);
         logger.info(`📡 Server URL: ${this.serverUrl}`);
-        logger.info(`⚙️ Configuration:`);
-        logger.info(`   - Batch Size: ${config.BATCH_SIZE || 2}`);
-        logger.info(`   - Max Concurrency: ${config.MAX_CONCURRENCY || 2}`);
-        logger.info(`   - Heartbeat Interval: ${config.HEARTBEAT_INTERVAL || 30000}ms`);
+        config.display();
 
         try {
-            // ✅ مقداردهی اولیه سیستم مدیریت گلوبال مرورگرها
             logger.info('🔧 Initializing global browser manager...');
             await initializeGlobalProfileManager();
 
-            // ✅ شروع پاکسازی دوره‌ای (فقط برای کلاستر master)
             if (globalBrowserManager.clusterId === '0' || !globalBrowserManager.clusterId) {
-                startPeriodicCleanup(10); // هر 10 دقیقه
+                startPeriodicCleanup(10);
                 logger.info('🧹 Periodic cleanup started (master cluster)');
             }
 
-            // ✅ نمایش آمار اولیه
             await showCurrentStats();
-
             logger.info(`✅ Global browser manager initialized for cluster ${globalBrowserManager.clusterId}`);
 
         } catch (initError) {
             logger.error(`❌ Failed to initialize global browser manager: ${initError.message}`);
-            // ادامه دهید حتی اگر مقداردهی اولیه ناموفق بود
         }
 
-        // راه‌اندازی اتصال
         this.initSocket();
-
-        // شروع heartbeat
         this.startHeartbeat();
-
-        // ✅ شروع نمایش آمار دوره‌ای
         this.startStatsDisplay();
 
-        // مدیریت سیگنال‌های خروج
         process.on('SIGINT', () => this.gracefulShutdown('SIGINT'));
         process.on('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
 
@@ -864,22 +804,16 @@ class PSNInstance {
         logger.info('✅ PSN Instance started successfully');
     }
 
-    /**
-    * خاموش کردن مناسب
-    */
     async gracefulShutdown(signal) {
         logger.info(`🛑 Received ${signal}, shutting down gracefully...`);
 
-        // متوقف کردن پردازش جدید
         this.isProcessing = false;
         this.connected = false;
         this.registered = false;
 
-        // ✅ پاکسازی شمارنده مرورگرهای این کلاستر
         try {
             logger.info(`🧹 Cleaning up cluster ${globalBrowserManager.clusterId} browser count...`);
 
-            // کاهش شمارنده برای تعداد پروفایل‌های ایجاد شده توسط این instance
             const activeProfiles = this.browserStats.profilesCreated - this.browserStats.profilesClosed;
             for (let i = 0; i < activeProfiles; i++) {
                 await globalBrowserManager.decrementBrowserCount();
@@ -890,7 +824,6 @@ class PSNInstance {
             logger.error(`❌ Error during browser cleanup: ${cleanupError.message}`);
         }
 
-        // بستن اتصال WebSocket
         if (this.socket) {
             this.socket.close();
         }
@@ -900,7 +833,7 @@ class PSNInstance {
     }
 }
 
-// راه‌اندازی instance
+// ==================== Application Startup ====================
 const instance = new PSNInstance();
 instance.start().catch((error) => {
     logger.error(`💥 Failed to start instance: ${error.message}`, error);

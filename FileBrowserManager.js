@@ -1,24 +1,41 @@
 import fs from "node:fs/promises";
-import path from "path"
+import path from "path";
 import { config } from "./utils/config.js";
 
-const SHARED_STATE_FILE = 'shared_browser_state.json';
+// ==================== Constants ====================
+const FILES = {
+    SHARED_STATE: 'shared_browser_state.json',
+    LOCK_FILE: 'browser_state.lock'
+};
 
+const LOCK_CONFIG = {
+    MAX_ATTEMPTS: 50,
+    BASE_TIMEOUT: 100,
+    MAX_DELAY: 1000,
+    STALE_LOCK_THRESHOLD: 30000, // 30 seconds
+    DEFAULT_TIMEOUT: 15000
+};
+
+const RETRY_CONFIG = {
+    MAX_RETRIES: 3,
+    BASE_DELAY: 1000
+};
+
+// ==================== Utility Functions ====================
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// ==================== FileBrowserManager Class ====================
 export default class FileBrowserManager {
     constructor() {
         this.clusterId = process.env.pm_id || process.pid;
         this.instanceId = `cluster_${this.clusterId}_${Date.now()}`;
-        this.lockFile = path.join(process.cwd(), 'browser_state.lock');
-        this.maxLockAttempts = 50; // تعداد تلاش‌های بیشتر
-        this.baseLockTimeout = 100; // timeout پایه کمتر
+        this.lockFile = path.join(process.cwd(), FILES.LOCK_FILE);
     }
 
-    // ✅ بهبود lock mechanism با exponential backoff
-    async acquireLock(timeout = 15000) {
+    // ==================== Lock Management ====================
+    async acquireLock(timeout = LOCK_CONFIG.DEFAULT_TIMEOUT) {
         const startTime = Date.now();
         let attempt = 0;
 
@@ -32,30 +49,10 @@ export default class FileBrowserManager {
                 }
 
                 attempt++;
-
-                // ✅ Exponential backoff با jitter
-                const baseDelay = Math.min(this.baseLockTimeout * Math.pow(1.5, attempt), 1000);
-                const jitter = Math.random() * 100; // تصادفی‌سازی برای جلوگیری از thundering herd
-                const delay = baseDelay + jitter;
-
-                // ✅ بررسی سن lock file
-                try {
-                    const lockStats = await fs.stat(this.lockFile);
-                    const lockAge = Date.now() - lockStats.mtime.getTime();
-
-                    // اگر lock بیش از 30 ثانیه قدیمی است، احتمالاً dead lock است
-                    if (lockAge > 30000) {
-                        console.log(`⚠️ Detected stale lock (${lockAge}ms old), attempting to break it...`);
-                        try {
-                            await fs.unlink(this.lockFile);
-                            console.log(`🔓 Stale lock removed`);
-                            continue; // تلاش مجدد بدون delay
-                        } catch (unlinkError) {
-                            // ممکن است کلاستر دیگری همزمان lock را حذف کرده باشد
-                        }
-                    }
-                } catch (statError) {
-                    // Lock file ممکن است وجود نداشته باشد
+                const delay = this._calculateLockDelay(attempt);
+                
+                if (await this._handleStaleLock()) {
+                    continue; // Try again immediately after removing stale lock
                 }
 
                 await sleep(delay);
@@ -63,6 +60,36 @@ export default class FileBrowserManager {
         }
 
         throw new Error(`Could not acquire lock after ${timeout}ms (${attempt} attempts)`);
+    }
+
+    _calculateLockDelay(attempt) {
+        const baseDelay = Math.min(
+            LOCK_CONFIG.BASE_TIMEOUT * Math.pow(1.5, attempt), 
+            LOCK_CONFIG.MAX_DELAY
+        );
+        const jitter = Math.random() * 100;
+        return baseDelay + jitter;
+    }
+
+    async _handleStaleLock() {
+        try {
+            const lockStats = await fs.stat(this.lockFile);
+            const lockAge = Date.now() - lockStats.mtime.getTime();
+
+            if (lockAge > LOCK_CONFIG.STALE_LOCK_THRESHOLD) {
+                console.log(`⚠️ Detected stale lock (${lockAge}ms old), attempting to break it...`);
+                try {
+                    await fs.unlink(this.lockFile);
+                    console.log(`🔓 Stale lock removed`);
+                    return true;
+                } catch (unlinkError) {
+                    // Another cluster might have removed it simultaneously
+                }
+            }
+        } catch (statError) {
+            // Lock file might not exist
+        }
+        return false;
     }
 
     async releaseLock() {
@@ -76,18 +103,13 @@ export default class FileBrowserManager {
         }
     }
 
-    // ✅ متد جدید برای عملیات بدون lock (فقط خواندن)
+    // ==================== State Management ====================
     async readStateWithoutLock() {
         try {
-            const data = await fs.readFile(SHARED_STATE_FILE, 'utf8');
+            const data = await fs.readFile(FILES.SHARED_STATE, 'utf8');
             return JSON.parse(data);
         } catch (error) {
-            return {
-                browserCount: 0,
-                profiles: {},
-                lastUpdated: Date.now(),
-                clusters: {}
-            };
+            return this._getDefaultState();
         }
     }
 
@@ -97,83 +119,111 @@ export default class FileBrowserManager {
 
     async writeState(state) {
         state.lastUpdated = Date.now();
-        await fs.writeFile(SHARED_STATE_FILE, JSON.stringify(state, null, 2));
+        await fs.writeFile(FILES.SHARED_STATE, JSON.stringify(state, null, 2));
     }
 
-    // ✅ بهبود increment با retry mechanism
+    _getDefaultState() {
+        return {
+            browserCount: 0,
+            profiles: {},
+            lastUpdated: Date.now(),
+            clusters: {}
+        };
+    }
+
+    // ==================== Browser Count Management ====================
     async incrementBrowserCount(retryCount = 0) {
-        const maxRetries = 3;
-
         try {
-            await this.acquireLock(5000 + (retryCount * 2000)); // timeout افزایشی
+            await this.acquireLock(this._getLockTimeout(retryCount));
 
             try {
                 const state = await this.readState();
-                state.browserCount = (state.browserCount || 0) + 1;
-
-                if (!state.clusters[this.clusterId]) {
-                    state.clusters[this.clusterId] = { count: 0, lastActivity: Date.now() };
-                }
-                state.clusters[this.clusterId].count++;
-                state.clusters[this.clusterId].lastActivity = Date.now();
-
+                const newCount = this._incrementStateCounters(state);
+                
                 await this.writeState(state);
-                console.log(`📈 Browser count increased to: ${state.browserCount} (Cluster ${this.clusterId}: ${state.clusters[this.clusterId].count})`);
-                return state.browserCount;
+                this._logBrowserCountChange('increased', newCount, state.clusters[this.clusterId].count);
+                
+                return newCount;
             } finally {
                 await this.releaseLock();
             }
         } catch (lockError) {
-            if (retryCount < maxRetries) {
-                console.log(`⚠️ Lock failed, retrying increment (${retryCount + 1}/${maxRetries})...`);
-                await sleep(1000 * (retryCount + 1));
-                return this.incrementBrowserCount(retryCount + 1);
-            }
-
-            // اگر lock نتوانست گرفته شود، حداقل شمارنده محلی را برگردانید
-            console.error(`❌ Failed to acquire lock for increment after ${maxRetries} retries`);
-            const state = await this.readStateWithoutLock();
-            return (state.browserCount || 0) + 1; // تخمین
+            return this._handleCounterOperationError('increment', retryCount, lockError);
         }
     }
 
-    // ✅ بهبود decrement با retry mechanism
     async decrementBrowserCount(retryCount = 0) {
-        const maxRetries = 3;
-
         try {
-            await this.acquireLock(5000 + (retryCount * 2000));
+            await this.acquireLock(this._getLockTimeout(retryCount));
 
             try {
                 const state = await this.readState();
-                state.browserCount = Math.max(0, (state.browserCount || 0) - 1);
-
-                if (state.clusters[this.clusterId]) {
-                    state.clusters[this.clusterId].count = Math.max(0, state.clusters[this.clusterId].count - 1);
-                    state.clusters[this.clusterId].lastActivity = Date.now();
-                }
-
+                const newCount = this._decrementStateCounters(state);
+                
                 await this.writeState(state);
-                console.log(`📉 Browser count decreased to: ${state.browserCount} (Cluster ${this.clusterId}: ${state.clusters[this.clusterId]?.count || 0})`);
-                return state.browserCount;
+                this._logBrowserCountChange('decreased', newCount, state.clusters[this.clusterId]?.count || 0);
+                
+                return newCount;
             } finally {
                 await this.releaseLock();
             }
         } catch (lockError) {
-            if (retryCount < maxRetries) {
-                console.log(`⚠️ Lock failed, retrying decrement (${retryCount + 1}/${maxRetries})...`);
-                await sleep(1000 * (retryCount + 1));
-                return this.decrementBrowserCount(retryCount + 1);
-            }
-
-            console.error(`❌ Failed to acquire lock for decrement after ${maxRetries} retries`);
-            const state = await this.readStateWithoutLock();
-            return Math.max(0, (state.browserCount || 0) - 1); // تخمین
+            return this._handleCounterOperationError('decrement', retryCount, lockError);
         }
     }
 
+    _incrementStateCounters(state) {
+        state.browserCount = (state.browserCount || 0) + 1;
+
+        if (!state.clusters[this.clusterId]) {
+            state.clusters[this.clusterId] = { count: 0, lastActivity: Date.now() };
+        }
+        state.clusters[this.clusterId].count++;
+        state.clusters[this.clusterId].lastActivity = Date.now();
+
+        return state.browserCount;
+    }
+
+    _decrementStateCounters(state) {
+        state.browserCount = Math.max(0, (state.browserCount || 0) - 1);
+
+        if (state.clusters[this.clusterId]) {
+            state.clusters[this.clusterId].count = Math.max(0, state.clusters[this.clusterId].count - 1);
+            state.clusters[this.clusterId].lastActivity = Date.now();
+        }
+
+        return state.browserCount;
+    }
+
+    _getLockTimeout(retryCount) {
+        return 5000 + (retryCount * 2000);
+    }
+
+    _logBrowserCountChange(action, totalCount, clusterCount) {
+        console.log(`📈📉 Browser count ${action} to: ${totalCount} (Cluster ${this.clusterId}: ${clusterCount})`);
+    }
+
+    async _handleCounterOperationError(operation, retryCount, lockError) {
+        if (retryCount < RETRY_CONFIG.MAX_RETRIES) {
+            console.log(`⚠️ Lock failed, retrying ${operation} (${retryCount + 1}/${RETRY_CONFIG.MAX_RETRIES})...`);
+            await sleep(RETRY_CONFIG.BASE_DELAY * (retryCount + 1));
+            
+            return operation === 'increment' 
+                ? this.incrementBrowserCount(retryCount + 1)
+                : this.decrementBrowserCount(retryCount + 1);
+        }
+
+        console.error(`❌ Failed to acquire lock for ${operation} after ${RETRY_CONFIG.MAX_RETRIES} retries`);
+        const state = await this.readStateWithoutLock();
+        
+        return operation === 'increment'
+            ? (state.browserCount || 0) + 1
+            : Math.max(0, (state.browserCount || 0) - 1);
+    }
+
+    // ==================== Browser Management ====================
     async getCurrentBrowserCount() {
-        const state = await this.readStateWithoutLock(); // بدون lock برای سرعت
+        const state = await this.readStateWithoutLock();
         return state.browserCount || 0;
     }
 
@@ -182,24 +232,21 @@ export default class FileBrowserManager {
         return currentCount < config.MAX_CONCURRENT_BROWSERS;
     }
 
-    // ✅ بهبود waitForAvailableSlot
     async waitForAvailableSlot(maxWaitTime = 60000) {
         const startTime = Date.now();
         let consecutiveFailures = 0;
 
         while (Date.now() - startTime < maxWaitTime) {
             try {
-                const canCreate = await this.canCreateNewBrowser();
-                if (canCreate) {
-                    consecutiveFailures = 0; // ریست کردن شمارنده خطا
+                if (await this.canCreateNewBrowser()) {
+                    consecutiveFailures = 0;
                     return true;
                 }
 
                 const currentCount = await this.getCurrentBrowserCount();
                 console.log(`⏳ Waiting for browser slot... (${currentCount}/${config.MAX_CONCURRENT_BROWSERS}) - Cluster ${this.clusterId}`);
 
-                // تاخیر تطبیقی
-                const waitTime = Math.min(2000 + (consecutiveFailures * 500), 10000);
+                const waitTime = this._calculateWaitTime(consecutiveFailures);
                 await sleep(waitTime);
 
             } catch (error) {
@@ -208,7 +255,7 @@ export default class FileBrowserManager {
 
                 if (consecutiveFailures > 5) {
                     console.log(`❌ Too many consecutive failures, assuming we can proceed`);
-                    return true; // فرض کنیم که می‌توانیم ادامه دهیم
+                    return true;
                 }
 
                 await sleep(1000 * consecutiveFailures);
@@ -218,34 +265,29 @@ export default class FileBrowserManager {
         throw new Error(`Timeout waiting for available browser slot after ${maxWaitTime}ms`);
     }
 
-    // ✅ register profile بدون lock اجباری
+    _calculateWaitTime(consecutiveFailures) {
+        return Math.min(2000 + (consecutiveFailures * 500), 10000);
+    }
+
+    // ==================== Profile Management ====================
     async registerProfile(profileId, profileName) {
         try {
-            await this.acquireLock(3000); // timeout کمتر
+            await this.acquireLock(3000);
 
             try {
                 const state = await this.readState();
-
-                state.profiles[profileId] = {
-                    id: profileId,
-                    name: profileName,
-                    clusterId: this.clusterId,
-                    instanceId: this.instanceId,
-                    createdAt: Date.now()
-                };
-
+                state.profiles[profileId] = this._createProfileRecord(profileId, profileName);
+                
                 await this.writeState(state);
                 console.log(`📝 Registered profile: ${profileName} (${profileId}) - Cluster ${this.clusterId}`);
             } finally {
                 await this.releaseLock();
             }
         } catch (lockError) {
-            // اگر register نتوانست انجام شود، مشکل خاصی نیست
             console.log(`⚠️ Could not register profile ${profileId}: ${lockError.message}`);
         }
     }
 
-    // ✅ unregister profile بدون lock اجباری
     async unregisterProfile(profileId) {
         try {
             await this.acquireLock(3000);
@@ -266,22 +308,28 @@ export default class FileBrowserManager {
         }
     }
 
+    _createProfileRecord(profileId, profileName) {
+        return {
+            id: profileId,
+            name: profileName,
+            clusterId: this.clusterId,
+            instanceId: this.instanceId,
+            createdAt: Date.now()
+        };
+    }
+
     async getAllActiveProfiles() {
         const state = await this.readStateWithoutLock();
         return state.profiles || {};
     }
 
+    // ==================== System Management ====================
     async resetCounters() {
         try {
             await this.acquireLock(10000);
 
             try {
-                const state = {
-                    browserCount: 0,
-                    profiles: {},
-                    lastUpdated: Date.now(),
-                    clusters: {}
-                };
+                const state = this._getDefaultState();
                 await this.writeState(state);
                 console.log('🔄 Browser counters reset');
             } finally {
@@ -289,19 +337,17 @@ export default class FileBrowserManager {
             }
         } catch (lockError) {
             console.error(`❌ Could not reset counters: ${lockError.message}`);
-            // در صورت عدم موفقیت، فایل را مستقیم بازنویسی کنید
-            try {
-                const state = {
-                    browserCount: 0,
-                    profiles: {},
-                    lastUpdated: Date.now(),
-                    clusters: {}
-                };
-                await this.writeState(state);
-                console.log('🔄 Browser counters force reset');
-            } catch (forceError) {
-                console.error(`❌ Force reset failed: ${forceError.message}`);
-            }
+            await this._forceResetCounters();
+        }
+    }
+
+    async _forceResetCounters() {
+        try {
+            const state = this._getDefaultState();
+            await this.writeState(state);
+            console.log('🔄 Browser counters force reset');
+        } catch (forceError) {
+            console.error(`❌ Force reset failed: ${forceError.message}`);
         }
     }
 
@@ -322,25 +368,7 @@ export default class FileBrowserManager {
 
             try {
                 const state = await this.readState();
-                const currentTime = Date.now();
-                let cleanedCount = 0;
-
-                for (const [clusterId, clusterInfo] of Object.entries(state.clusters || {})) {
-                    if (currentTime - clusterInfo.lastActivity > maxInactiveTime) {
-                        console.log(`🧹 Cleaning up dead cluster: ${clusterId}`);
-
-                        state.browserCount = Math.max(0, state.browserCount - clusterInfo.count);
-                        delete state.clusters[clusterId];
-
-                        for (const [profileId, profileData] of Object.entries(state.profiles || {})) {
-                            if (profileData.clusterId === clusterId) {
-                                delete state.profiles[profileId];
-                            }
-                        }
-
-                        cleanedCount++;
-                    }
-                }
+                const cleanedCount = this._performClusterCleanup(state, maxInactiveTime);
 
                 if (cleanedCount > 0) {
                     await this.writeState(state);
@@ -355,5 +383,30 @@ export default class FileBrowserManager {
             console.log(`⚠️ Could not cleanup dead clusters: ${lockError.message}`);
             return 0;
         }
+    }
+
+    _performClusterCleanup(state, maxInactiveTime) {
+        const currentTime = Date.now();
+        let cleanedCount = 0;
+
+        for (const [clusterId, clusterInfo] of Object.entries(state.clusters || {})) {
+            if (currentTime - clusterInfo.lastActivity > maxInactiveTime) {
+                console.log(`🧹 Cleaning up dead cluster: ${clusterId}`);
+
+                state.browserCount = Math.max(0, state.browserCount - clusterInfo.count);
+                delete state.clusters[clusterId];
+
+                // Remove profiles belonging to dead cluster
+                for (const [profileId, profileData] of Object.entries(state.profiles || {})) {
+                    if (profileData.clusterId === clusterId) {
+                        delete state.profiles[profileId];
+                    }
+                }
+
+                cleanedCount++;
+            }
+        }
+
+        return cleanedCount;
     }
 }
