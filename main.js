@@ -4,7 +4,11 @@ import {
     createNewProfile,
     processFakeAccountFirst,
     processAccountInTab,
-    cleanupProfile
+    cleanupProfile,
+    initializeGlobalProfileManager,
+    startPeriodicCleanup,
+    showCurrentStats,
+    globalBrowserManager
 } from "./bot.js";
 import { logger } from "./utils/logger.js";
 import { config } from "./utils/config.js";
@@ -32,6 +36,13 @@ class PSNInstance {
             success: 0,
             errors: 0,
             startTime: Date.now()
+        };
+
+        // ✅ اضافه کردن آمار مرورگر
+        this.browserStats = {
+            profilesCreated: 0,
+            profilesClosed: 0,
+            browserErrors: 0
         };
     }
 
@@ -89,25 +100,21 @@ class PSNInstance {
 
         // دریافت پروکسی
         this.socket.on("proxy-assigned", (proxyData) => {
-            // این event در requestProxy() handle می‌شه
             logger.debug(`📡 Proxy assigned event received`);
         });
 
         // عدم وجود پروکسی
         this.socket.on("no-proxy-available", (data) => {
-            // این event در requestProxy() handle می‌شه
             logger.debug(`📡 No proxy available event received`);
         });
 
         // دریافت اکانت‌ها
         this.socket.on("accounts-assigned", (accountsData) => {
-            // این event در requestAccounts() handle می‌شه
             logger.debug(`📡 Accounts assigned event received`);
         });
 
         // عدم وجود اکانت
         this.socket.on("no-accounts-available", (data) => {
-            // این event در requestAccounts() handle می‌شه
             logger.debug(`📡 No accounts available event received`);
         });
 
@@ -149,7 +156,8 @@ class PSNInstance {
                 platform: process.platform,
                 nodeVersion: process.version,
                 memory: process.memoryUsage(),
-                pid: process.pid
+                pid: process.pid,
+                clusterId: globalBrowserManager.clusterId // ✅ اضافه کردن cluster ID
             },
             capabilities: {
                 batchSize: config.BATCH_SIZE || 3,
@@ -173,10 +181,8 @@ class PSNInstance {
                 reject(new Error('Proxy request timeout after 30 seconds'));
             }, 15000);
 
-            // ارسال درخواست پروکسی
             this.socket.emit("request-proxy");
 
-            // گوش دادن به پاسخ موفق
             const onProxyAssigned = (proxyData) => {
                 clearTimeout(timeout);
                 this.socket.off("proxy-assigned", onProxyAssigned);
@@ -185,7 +191,6 @@ class PSNInstance {
                 resolve(proxyData);
             };
 
-            // گوش دادن به عدم وجود پروکسی
             const onNoProxy = (data) => {
                 clearTimeout(timeout);
                 this.socket.off("proxy-assigned", onProxyAssigned);
@@ -210,10 +215,8 @@ class PSNInstance {
                 reject(new Error('Accounts request timeout after 30 seconds'));
             }, 15000);
 
-            // ارسال درخواست اکانت‌ها
             this.socket.emit("request-accounts", { batchSize });
 
-            // گوش دادن به پاسخ موفق
             const onAccountsAssigned = (accountsData) => {
                 clearTimeout(timeout);
                 this.socket.off("accounts-assigned", onAccountsAssigned);
@@ -222,7 +225,6 @@ class PSNInstance {
                 resolve(accountsData);
             };
 
-            // گوش دادن به عدم وجود اکانت
             const onNoAccounts = (data) => {
                 clearTimeout(timeout);
                 this.socket.off("accounts-assigned", onAccountsAssigned);
@@ -260,10 +262,14 @@ class PSNInstance {
         try {
             logger.info('🚀 Starting new workflow...');
 
-            // ارسال وضعیت شروع کار
+            // ✅ نمایش آمار فعلی مرورگرها
+            const browserStats = await globalBrowserManager.getClusterStats();
+            logger.info(`📊 Current browser stats: ${browserStats.totalBrowsers}/${browserStats.maxBrowsers} (Cluster ${globalBrowserManager.clusterId})`);
+
             this.sendHeartbeat('starting', {
                 message: 'Starting new workflow',
-                startedAt: this.workStartTime
+                startedAt: this.workStartTime,
+                browserStats: browserStats
             });
 
             // مرحله 1: دریافت پروکسی
@@ -274,12 +280,11 @@ class PSNInstance {
             } catch (proxyError) {
                 logger.error(`❌ Step 1 failed: ${proxyError.message}`);
 
-                // اگر پروکسی نیست، بعداً دوباره تلاش کن
                 setTimeout(() => {
                     if (this.connected && this.registered) {
                         this.processWorkFlow();
                     }
-                }, 15000); // 1 دقیقه تاخیر
+                }, 15000);
 
                 return;
             }
@@ -287,22 +292,58 @@ class PSNInstance {
             // مرحله 2: ایجاد پروفایل با پروکسی
             logger.info('🔧 Step 2: Creating profile with proxy...');
             try {
+                // ✅ استفاده از createNewProfile بهبود یافته
                 profileData = await createNewProfile(proxy, []);
                 const context = profileData.context;
                 const profile = profileData.profile;
-                logger.info('✅ Step 2 completed: Profile created successfully');
 
-                // ارسال وضعیت ایجاد پروفایل
+                // ✅ آپدیت آمار
+                this.browserStats.profilesCreated++;
+
+                logger.info('✅ Step 2 completed: Profile created successfully');
+                logger.info(`📊 Profile created by cluster ${globalBrowserManager.clusterId}: ${profile.name}`);
+
+                // ✅ نمایش آمار جدید
+                const updatedStats = await globalBrowserManager.getClusterStats();
+                logger.info(`📈 Updated browser stats: ${updatedStats.totalBrowsers}/${updatedStats.maxBrowsers}`);
+
                 this.sendHeartbeat('profile-created', {
                     proxyHost: proxy.host,
                     proxyPort: proxy.port,
-                    profileId: profile.id
+                    profileId: profile.id,
+                    clusterId: globalBrowserManager.clusterId,
+                    browserStats: updatedStats
                 });
 
             } catch (profileError) {
                 logger.error(`❌ Step 2 failed: ${profileError.message}`);
 
-                // گزارش خطای پروکسی
+                // ✅ آپدیت آمار خطا
+                this.browserStats.browserErrors++;
+
+                // ✅ مدیریت خطاهای مرتبط با محدودیت مرورگر
+                if (profileError.message.includes('Concurrent browsers limit exceeded') ||
+                    profileError.message.includes('Global browser limit exceeded') ||
+                    profileError.message.includes('HTTP 402')) {
+
+                    logger.warn('🚫 Browser limit exceeded, waiting longer before retry...');
+
+                    this.socket.emit("release-proxy", {
+                        proxyId: proxy.id,
+                        error: profileError.message,
+                        success: false
+                    });
+
+                    // تاخیر بیشتر برای خطاهای محدودیت مرورگر
+                    setTimeout(() => {
+                        if (this.connected && this.registered) {
+                            this.processWorkFlow();
+                        }
+                    }, 30000); // 30 ثانیه تاخیر
+
+                    return;
+                }
+
                 this.socket.emit("release-proxy", {
                     proxyId: proxy.id,
                     error: profileError.message,
@@ -325,7 +366,6 @@ class PSNInstance {
             } catch (fakeError) {
                 logger.error(`❌ Step 3 failed: ${fakeError.message}`);
 
-                // اگر فیک اکانت fail شد، ممکنه پروکسی مشکل داشته باشه
                 if (fakeError.message.includes('PROXY_') ||
                     fakeError.message.includes('CONNECTION_') ||
                     fakeError.message.includes('CONTEXT_DESTROYED')) {
@@ -340,14 +380,13 @@ class PSNInstance {
                     throw fakeError;
                 }
 
-                // اگر خطای عادی بود، ادامه بده
                 logger.warn('⚠️ Fake account failed but continuing with real accounts...');
             }
 
             // مرحله 4: دریافت اکانت‌های واقعی
             logger.info('📋 Step 4: Requesting real accounts...');
             try {
-                accountsData = await this.requestAccounts(3); // فقط 3 اکانت
+                accountsData = await this.requestAccounts(3);
                 accounts = accountsData.accounts;
                 logger.info(`✅ Step 4 completed: ${accounts.length} accounts received`);
 
@@ -359,12 +398,11 @@ class PSNInstance {
             } catch (accountsError) {
                 logger.error(`❌ Step 4 failed: ${accountsError.message}`);
 
-                // اگر اکانت نیست، بعداً دوباره تلاش کن
                 setTimeout(() => {
                     if (this.connected && this.registered) {
                         this.processWorkFlow();
                     }
-                }, 15000); // 30 ثانیه تاخیر
+                }, 15000);
 
                 return;
             }
@@ -381,7 +419,7 @@ class PSNInstance {
             logger.info(`✅ Step 5 completed: ${results.length} results generated`);
 
             // آپدیت آمار محلی
-            results.forEach(result => {
+            results?.finalResults?.forEach(result => {
                 this.stats.processed++;
                 if (result.status === 'good') {
                     this.stats.success++;
@@ -392,36 +430,34 @@ class PSNInstance {
 
             // مرحله 6: ارسال نتایج
             logger.info('📊 Step 6: Submitting results to server...');
-            await this.submitResults(results, proxy, accountsData.batchId);
+            await this.submitResults(results?.finalResults, proxy, accountsData.batchId);
             logger.info('✅ Step 6 completed: Results submitted successfully');
 
             // مرحله 7: پاک‌سازی
             logger.info('🧹 Step 7: Cleaning up resources...');
-            await profileData.context.close();
-            await cleanupProfile(profileData.profile);
-            logger.info('✅ Step 7 completed: Cleanup successful');
 
+            // ✅ استفاده از closeProfile بهبود یافته
+            await this.closeProfileSafely(profileData);
+
+            logger.info('✅ Step 7 completed: Cleanup successful');
             logger.info('🎉 Workflow completed successfully!');
 
         } catch (error) {
             logger.error(`❌ Workflow error: ${error.message}`);
 
-            // گزارش خطا به سرور
+            // ✅ آپدیت آمار خطا
+            this.browserStats.browserErrors++;
+
             this.reportError(error, {
                 step: 'workflow',
                 proxy: proxy ? `${proxy.host}:${proxy.port}` : null,
-                accountCount: accounts.length
+                accountCount: accounts.length,
+                clusterId: globalBrowserManager.clusterId
             });
 
             // پاک‌سازی در صورت خطا
             if (profileData) {
-                try {
-                    logger.info('🧹 Emergency cleanup: Closing context and profile...');
-                    await profileData.context.close();
-                    await cleanupProfile(profileData.profile);
-                } catch (cleanupError) {
-                    logger.error(`❌ Emergency cleanup error: ${cleanupError.message}`);
-                }
+                await this.closeProfileSafely(profileData);
             }
 
             // آزادسازی منابع در صورت خطا
@@ -442,18 +478,68 @@ class PSNInstance {
                 });
             }
 
-            // تاخیر بیشتر در صورت خطا
+            // ✅ تاخیر متغیر بر اساس نوع خطا
+            let retryDelay = 10000; // پیش‌فرض 10 ثانیه
+
+            if (error.message.includes('Concurrent browsers limit exceeded') ||
+                error.message.includes('Global browser limit exceeded') ||
+                error.message.includes('HTTP 402')) {
+                retryDelay = 30000; // 30 ثانیه برای خطاهای محدودیت مرورگر
+                logger.warn(`🚫 Browser limit error, waiting ${retryDelay / 1000} seconds before retry...`);
+            }
+
             setTimeout(() => {
                 if (this.connected && this.registered) {
                     this.processWorkFlow();
                 }
-            }, 10000); // 10 ثانیه تاخیر
+            }, retryDelay);
 
         } finally {
             this.isProcessing = false;
+
+            // ✅ ارسال آمار نهایی
+            const finalStats = await globalBrowserManager.getClusterStats();
             this.sendHeartbeat('idle', {
-                message: 'Workflow completed, back to idle'
+                message: 'Workflow completed, back to idle',
+                browserStats: finalStats,
+                instanceBrowserStats: this.browserStats
             });
+        }
+    }
+
+    /**
+    * ✅ متد جدید برای بستن امن پروفایل
+    */
+    async closeProfileSafely(profileData) {
+        try {
+            if (profileData && profileData.context) {
+                await profileData.context.close();
+            }
+
+            if (profileData && profileData.profile) {
+                await cleanupProfile(profileData.profile);
+            }
+
+            // ✅ کاهش شمارنده گلوبال
+            if (profileData && profileData.globalManager) {
+                await profileData.globalManager.decrementBrowserCount();
+                await profileData.globalManager.unregisterProfile(profileData.profile.id);
+            }
+
+            // ✅ آپدیت آمار
+            this.browserStats.profilesClosed++;
+
+            const updatedStats = await globalBrowserManager.getClusterStats();
+            logger.info(`📉 Profile closed. Global browsers: ${updatedStats.totalBrowsers}/${updatedStats.maxBrowsers}`);
+
+        } catch (cleanupError) {
+            logger.error(`❌ Profile cleanup error: ${cleanupError.message}`);
+            this.browserStats.browserErrors++;
+
+            // حتی در صورت خطا، شمارنده را کاهش دهید
+            if (profileData && profileData.globalManager) {
+                await profileData.globalManager.decrementBrowserCount();
+            }
         }
     }
 
@@ -467,7 +553,6 @@ class PSNInstance {
         let shouldExitGlobal = false;
         const completedResults = [];
 
-        // ✅ ایجاد promise برای هر اکانت
         const accountPromises = accounts.map(async (account, index) => {
             const startDelay = index * randomDelay(2000, 4000);
 
@@ -476,10 +561,9 @@ class PSNInstance {
                 await sleep(startDelay);
             }
 
-            // چک کردن abort signal قبل از شروع
             if (abortController.signal.aborted) {
                 logger.info(`⏹️ Account ${account.email} aborted before processing`);
-                return { type: 'aborted', account, index };
+                return [{ type: 'aborted', account, index }];
             }
 
             logger.info(`🚀 Starting account ${index + 1}: ${account.email}`);
@@ -487,13 +571,12 @@ class PSNInstance {
             try {
                 const accountString = `${account.email}:${account.password}`;
 
-                // اضافه کردن abort signal به processAccountInTab
                 const result = await processAccountInTab(
                     context,
                     accountString,
                     index,
                     accounts.length,
-                    abortController.signal // پاس دادن signal
+                    abortController.signal
                 );
 
                 const accountResult = {
@@ -540,20 +623,17 @@ class PSNInstance {
             }
         });
 
-        // ✅ پردازش promises با race condition
         const activePromises = [...accountPromises];
 
         while (activePromises.length > 0 && !shouldExitGlobal) {
             try {
                 const result = await Promise.race(activePromises);
 
-                // حذف promise تکمیل شده از لیست
                 const promiseIndex = activePromises.findIndex(p => p === accountPromises[result.index]);
                 if (promiseIndex > -1) {
                     activePromises.splice(promiseIndex, 1);
                 }
 
-                // پردازش نتیجه
                 if (result.type === 'exit') {
                     logger.warn(`🚨 Exit signal received from account ${result.result.email}. Aborting all processes...`);
                     shouldExitGlobal = true;
@@ -567,7 +647,6 @@ class PSNInstance {
                     logger.error(`❌ Account ${result.index + 1} error: ${result.result.email}`);
                     completedResults.push(result.result);
                 }
-                // aborted results را ignore می‌کنیم
 
             } catch (error) {
                 logger.error(`❌ Unexpected error in promise race: ${error.message}`);
@@ -575,15 +654,11 @@ class PSNInstance {
             }
         }
 
-        // اگر exit شده، منتظر تکمیل promise های باقی‌مانده نمی‌مانیم
         if (shouldExitGlobal) {
             logger.warn(`🚨 Processing stopped due to exit condition. Processed ${completedResults.length} accounts.`);
-
-            // کمی صبر کنیم تا abort signal به همه برسد
             await sleep(1000);
         } else {
             logger.info(`⏳ Waiting for remaining ${activePromises.length} accounts...`);
-            // اگر exit نشده، منتظر بقیه می‌مانیم
             const remainingResults = await Promise.allSettled(activePromises);
 
             remainingResults.forEach((result, i) => {
@@ -599,7 +674,7 @@ class PSNInstance {
         logger.info(`📈 Final summary: ${successCount} success, ${errorCount} errors, Total: ${completedResults.length}`);
 
         return {
-            results: completedResults,
+            finalResults: completedResults,
             exitTriggered: shouldExitGlobal,
             totalProcessed: completedResults.length,
             successCount,
@@ -626,7 +701,9 @@ class PSNInstance {
                 processingTime: processingTime,
                 startTime: this.workStartTime,
                 endTime: Date.now(),
-                instanceStats: this.getStats()
+                instanceStats: this.getStats(),
+                browserStats: this.browserStats, // ✅ اضافه کردن آمار مرورگر
+                clusterId: globalBrowserManager.clusterId // ✅ اضافه کردن cluster ID
             }
         };
 
@@ -637,7 +714,6 @@ class PSNInstance {
                 reject(new Error('Results submission timeout'));
             }, 15000);
 
-            // گوش دادن به تایید
             const onAcknowledged = (data) => {
                 clearTimeout(timeout);
                 this.socket.off("results-acknowledged", onAcknowledged);
@@ -658,6 +734,8 @@ class PSNInstance {
                 status: status,
                 currentBatch: currentBatch,
                 stats: this.getStats(),
+                browserStats: this.browserStats, // ✅ اضافه کردن آمار مرورگر
+                clusterId: globalBrowserManager.clusterId, // ✅ اضافه کردن cluster ID
                 timestamp: Date.now()
             });
         }
@@ -672,7 +750,11 @@ class PSNInstance {
                 type: error.name || 'UnknownError',
                 message: error.message,
                 stack: error.stack,
-                context: context,
+                context: {
+                    ...context,
+                    clusterId: globalBrowserManager.clusterId, // ✅ اضافه کردن cluster ID
+                    browserStats: this.browserStats
+                },
                 instanceId: this.instanceId,
                 timestamp: Date.now()
             });
@@ -695,7 +777,9 @@ class PSNInstance {
                 Math.round(uptime / this.stats.processed) : 0,
             isProcessing: this.isProcessing,
             connected: this.connected,
-            registered: this.registered
+            registered: this.registered,
+            browserStats: this.browserStats, // ✅ اضافه کردن آمار مرورگر
+            clusterId: globalBrowserManager.clusterId // ✅ اضافه کردن cluster ID
         };
     }
 
@@ -709,6 +793,20 @@ class PSNInstance {
     }
 
     /**
+    * ✅ شروع نمایش آمار دوره‌ای
+    */
+    startStatsDisplay() {
+        setInterval(async () => {
+            try {
+                const globalStats = await globalBrowserManager.getClusterStats();
+                logger.info(`📊 Global Browser Stats: ${globalStats.totalBrowsers}/${globalStats.maxBrowsers} | Instance: Created=${this.browserStats.profilesCreated}, Closed=${this.browserStats.profilesClosed}, Errors=${this.browserStats.browserErrors}`);
+            } catch (error) {
+                logger.error('Error displaying stats:', error.message);
+            }
+        }, 60000); // هر دقیقه
+    }
+
+    /**
     * راه‌اندازی instance
     */
     async start() {
@@ -719,11 +817,35 @@ class PSNInstance {
         logger.info(`   - Max Concurrency: ${config.MAX_CONCURRENCY || 2}`);
         logger.info(`   - Heartbeat Interval: ${config.HEARTBEAT_INTERVAL || 30000}ms`);
 
+        try {
+            // ✅ مقداردهی اولیه سیستم مدیریت گلوبال مرورگرها
+            logger.info('🔧 Initializing global browser manager...');
+            await initializeGlobalProfileManager();
+
+            // ✅ شروع پاکسازی دوره‌ای (فقط برای کلاستر master)
+            if (globalBrowserManager.clusterId === '0' || !globalBrowserManager.clusterId) {
+                startPeriodicCleanup(10); // هر 10 دقیقه
+                logger.info('🧹 Periodic cleanup started (master cluster)');
+            }
+
+            // ✅ نمایش آمار اولیه
+            await showCurrentStats();
+
+            logger.info(`✅ Global browser manager initialized for cluster ${globalBrowserManager.clusterId}`);
+
+        } catch (initError) {
+            logger.error(`❌ Failed to initialize global browser manager: ${initError.message}`);
+            // ادامه دهید حتی اگر مقداردهی اولیه ناموفق بود
+        }
+
         // راه‌اندازی اتصال
         this.initSocket();
 
         // شروع heartbeat
         this.startHeartbeat();
+
+        // ✅ شروع نمایش آمار دوره‌ای
+        this.startStatsDisplay();
 
         // مدیریت سیگنال‌های خروج
         process.on('SIGINT', () => this.gracefulShutdown('SIGINT'));
@@ -753,6 +875,21 @@ class PSNInstance {
         this.connected = false;
         this.registered = false;
 
+        // ✅ پاکسازی شمارنده مرورگرهای این کلاستر
+        try {
+            logger.info(`🧹 Cleaning up cluster ${globalBrowserManager.clusterId} browser count...`);
+
+            // کاهش شمارنده برای تعداد پروفایل‌های ایجاد شده توسط این instance
+            const activeProfiles = this.browserStats.profilesCreated - this.browserStats.profilesClosed;
+            for (let i = 0; i < activeProfiles; i++) {
+                await globalBrowserManager.decrementBrowserCount();
+            }
+
+            logger.info(`✅ Cleaned up ${activeProfiles} active profiles from global count`);
+        } catch (cleanupError) {
+            logger.error(`❌ Error during browser cleanup: ${cleanupError.message}`);
+        }
+
         // بستن اتصال WebSocket
         if (this.socket) {
             this.socket.close();
@@ -768,5 +905,4 @@ const instance = new PSNInstance();
 instance.start().catch((error) => {
     logger.error(`💥 Failed to start instance: ${error.message}`, error);
     process.exit(1);
-
 });

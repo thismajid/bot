@@ -7,8 +7,12 @@ import { dirname } from 'path';
 import { faker } from '@faker-js/faker';
 import path from "node:path";
 import { logger } from "./utils/logger.js";
-import axios from 'axios'
-import FingerprintManager from "./FingerprintManager.js"
+import axios from 'axios';
+import FingerprintManager from "./FingerprintManager.js";
+import FileBrowserManager from "./FileBrowserManager.js";
+import { config } from "./utils/config.js";
+
+const globalBrowserManager = new FileBrowserManager();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -439,6 +443,13 @@ async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
     const maxRetries = 3;
 
     try {
+        // بررسی محدودیت گلوبال قبل از ایجاد پروفایل
+        const canCreate = await globalBrowserManager.canCreateNewBrowser();
+        if (!canCreate) {
+            console.log(`⏳ Global browser limit reached, waiting... (Cluster: ${globalBrowserManager.clusterId})`);
+            await globalBrowserManager.waitForAvailableSlot();
+        }
+
         console.log("Creating new profile...");
 
         // مقداردهی fingerprintManager اگر هنوز نشده
@@ -446,14 +457,13 @@ async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
             fingerprintManager = initializeFingerprintManager(client);
         }
 
-        // استفاده از سیستم متعادل برای انتخاب فینگرپرینت
         const fingerprint = await selectBalancedFingerprint();
 
         if (!fingerprint) {
             throw new Error("No fingerprint available");
         }
 
-        const profileName = `Profile_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+        const profileName = `Profile_${Date.now()}_${Math.random().toString(36).substr(2, 5)}_C${globalBrowserManager.clusterId}`;
 
         const createProfileRequest = {
             fingerprintId: fingerprint.id,
@@ -483,6 +493,18 @@ async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
 
         const profile = await client.profile.createProfile(createProfileRequest);
 
+        // افزایش شمارنده گلوبال قبل از اتصال
+        const newCount = await globalBrowserManager.incrementBrowserCount();
+        if (newCount > config.MAX_CONCURRENT_BROWSERS) {
+            // اگر حد مجاز رد شد، شمارنده را کاهش دهید و خطا پرتاب کنید
+            await globalBrowserManager.decrementBrowserCount();
+            await client.profile.deleteProfile(profile.id);
+            throw new Error("Global browser limit exceeded during creation");
+        }
+
+        // ثبت پروفایل در فایل مشترک
+        await globalBrowserManager.registerProfile(profile.id, profileName);
+
         // Connect with increased timeout
         const ws = `ws://localhost:${KAMELEO_PORT}/playwright/${profile.id}`;
         const pwBridgePath = resolvePwBridgePath();
@@ -505,7 +527,12 @@ async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
         await testPage.goto('about:blank', { timeout: 10000 });
         await testPage.close();
 
-        console.log("✅ Profile created and tested successfully");
+        const stats = await globalBrowserManager.getClusterStats();
+        console.log(`✅ Profile created successfully. Global stats:`, {
+            active: stats.totalBrowsers,
+            max: stats.maxBrowsers,
+            cluster: globalBrowserManager.clusterId
+        });
 
         return {
             profile: {
@@ -514,19 +541,37 @@ async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
             },
             context,
             proxy: proxy,
-            fingerprintId: fingerprint.id
+            fingerprintId: fingerprint.id,
+            globalManager: globalBrowserManager
         };
 
     } catch (err) {
         console.error("Error creating profile:", err.message);
 
+        // کاهش شمارنده گلوبال در صورت خطا
+        await globalBrowserManager.decrementBrowserCount();
+
         // Clean up failed profile
         try {
             if (err.profile?.id) {
                 await client.profile.deleteProfile(err.profile.id);
+                await globalBrowserManager.unregisterProfile(err.profile.id);
             }
         } catch (cleanupErr) {
             console.log("Cleanup error:", cleanupErr.message);
+        }
+
+        // Handle concurrent browser limit error
+        if (err.message.includes('Concurrent browsers limit exceeded') ||
+            err.message.includes('HTTP 402') ||
+            err.message.includes('Global browser limit exceeded')) {
+            console.log(`❌ Browser limit exceeded globally, waiting...`);
+
+            if (retryCount < maxRetries) {
+                console.log(`🔄 Retrying after global cleanup (${retryCount + 1}/${maxRetries})...`);
+                await sleep(5000 * (retryCount + 1));
+                return createNewProfile(proxy, cookies, retryCount + 1);
+            }
         }
 
         // Handle specific timeout errors
@@ -558,6 +603,174 @@ async function createNewProfile(proxy = null, cookies = [], retryCount = 0) {
         }
 
         throw err;
+    }
+}
+
+async function closeProfile(profileData) {
+    try {
+        if (profileData.context) {
+            await profileData.context.close();
+        }
+
+        if (profileData.profile?.id) {
+            await client.profile.deleteProfile(profileData.profile.id);
+            await globalBrowserManager.unregisterProfile(profileData.profile.id);
+        }
+
+        // کاهش شمارنده گلوبال
+        const newCount = await globalBrowserManager.decrementBrowserCount();
+        const stats = await globalBrowserManager.getClusterStats();
+        console.log(`Browser closed. Global active browsers: ${newCount}/${config.MAX_CONCURRENT_BROWSERS} (Cluster ${globalBrowserManager.clusterId})`);
+
+    } catch (error) {
+        console.error("Error closing profile:", error.message);
+        // حتی در صورت خطا، شمارنده را کاهش دهید
+        await globalBrowserManager.decrementBrowserCount();
+    }
+}
+
+async function cleanupOldProfiles() {
+    try {
+        console.log("🧹 Global cleanup: checking old profiles across all clusters...");
+
+        const profiles = await client.profile.listProfiles();
+        const activeProfiles = await globalBrowserManager.getAllActiveProfiles();
+        const currentTime = Date.now();
+        const fiveMinutesInMs = 5 * 60 * 1000;
+
+        let deletedCount = 0;
+        let stoppedCount = 0;
+
+        for (const profile of profiles) {
+            try {
+                let profileAge = 0;
+
+                // بررسی اینکه آیا پروفایل در فایل مشترک ثبت شده است
+                const registeredProfile = activeProfiles[profile.id];
+                if (registeredProfile) {
+                    profileAge = currentTime - registeredProfile.createdAt;
+                } else {
+                    // اگر در فایل مشترک نیست، از نام استفاده کنید
+                    const timestampMatch = profile.name.match(/Profile_(\d+)_/);
+                    if (timestampMatch) {
+                        profileAge = currentTime - parseInt(timestampMatch[1]);
+                    } else {
+                        profileAge = fiveMinutesInMs + 1; // فرض کنیم قدیمی است
+                    }
+                }
+
+                if (profileAge > fiveMinutesInMs) {
+                    const ageInMinutes = Math.round(profileAge / 60000);
+                    const ownerCluster = registeredProfile ? registeredProfile.clusterId : 'unknown';
+                    console.log(`🕒 Profile ${profile.name} is ${ageInMinutes} minutes old (Owner: Cluster ${ownerCluster}), cleaning up...`);
+
+                    // استاپ کردن پروفایل
+                    try {
+                        await client.profile.stopProfile(profile.id);
+                        stoppedCount++;
+                        console.log(`⏹️ Stopped profile: ${profile.name}`);
+                        await sleep(1000);
+                    } catch (stopErr) {
+                        console.log(`⚠️ Could not stop profile ${profile.name}:`, stopErr.message);
+                    }
+
+                    // دیلیت کردن پروفایل
+                    try {
+                        await client.profile.deleteProfile(profile.id);
+                        await globalBrowserManager.unregisterProfile(profile.id);
+                        await globalBrowserManager.decrementBrowserCount();
+
+                        deletedCount++;
+                        console.log(`🗑️ Deleted profile: ${profile.name}`);
+                    } catch (deleteErr) {
+                        console.log(`❌ Failed to delete profile ${profile.name}:`, deleteErr.message);
+                    }
+
+                    await sleep(500);
+                } else {
+                    const remainingMinutes = Math.round((fiveMinutesInMs - profileAge) / 60000);
+                    console.log(`✅ Profile ${profile.name} is still fresh (${remainingMinutes} minutes remaining)`);
+                }
+
+            } catch (err) {
+                console.log(`❌ Error processing profile ${profile.id}:`, err.message);
+            }
+        }
+
+        // پاکسازی کلاسترهای مرده
+        const cleanedClusters = await globalBrowserManager.cleanupDeadClusters();
+
+        const stats = await globalBrowserManager.getClusterStats();
+        console.log(`✅ Global cleanup completed: ${stoppedCount} stopped, ${deletedCount} deleted, ${cleanedClusters} dead clusters cleaned`);
+        console.log(`📊 Global stats:`, stats);
+
+        return {
+            stopped: stoppedCount,
+            deleted: deletedCount,
+            total: profiles.length,
+            cleanedClusters: cleanedClusters
+        };
+
+    } catch (error) {
+        console.error("❌ Global cleanup error:", error.message);
+        return {
+            stopped: 0,
+            deleted: 0,
+            total: 0,
+            cleanedClusters: 0,
+            error: error.message
+        };
+    }
+}
+
+async function initializeGlobalProfileManager() {
+    try {
+        console.log(`🚀 Initializing global profile manager for cluster ${globalBrowserManager.clusterId}`);
+
+        if (globalBrowserManager.clusterId === '0' || !globalBrowserManager.clusterId) {
+            console.log("🧹 Master cluster performing initial cleanup...");
+            await globalBrowserManager.resetCounters();
+            await cleanupOldProfiles();
+        } else {
+            await sleep(1000);
+            await globalBrowserManager.cleanupDeadClusters();
+        }
+
+        const stats = await globalBrowserManager.getClusterStats();
+        console.log(`✅ Global profile manager initialized for cluster ${globalBrowserManager.clusterId}`);
+        console.log(`📊 Current global stats:`, stats);
+
+    } catch (error) {
+        console.error("❌ Global profile manager initialization error:", error.message);
+    }
+}
+
+function startPeriodicCleanup(intervalMinutes = 10) {
+    console.log(`🔄 Starting periodic cleanup every ${intervalMinutes} minutes (Cluster ${globalBrowserManager.clusterId})`);
+
+    setInterval(async () => {
+        console.log(`🕐 Running scheduled cleanup... (Cluster ${globalBrowserManager.clusterId})`);
+        await cleanupOldProfiles();
+    }, intervalMinutes * 60 * 1000);
+}
+
+async function showCurrentStats() {
+    try {
+        const stats = await globalBrowserManager.getClusterStats();
+        console.log('📊 Current Global Browser Stats:');
+        console.log(`   Total Active Browsers: ${stats.totalBrowsers}/${stats.maxBrowsers}`);
+        console.log(`   Active Profiles: ${stats.profilesCount}`);
+        console.log(`   Active Clusters: ${Object.keys(stats.clusters).length}`);
+
+        for (const [clusterId, clusterInfo] of Object.entries(stats.clusters)) {
+            const lastActivity = new Date(clusterInfo.lastActivity).toLocaleTimeString();
+            console.log(`   - Cluster ${clusterId}: ${clusterInfo.count} browsers (Last activity: ${lastActivity})`);
+        }
+
+        return stats;
+    } catch (error) {
+        console.error('Error getting stats:', error.message);
+        return null;
     }
 }
 
@@ -1108,7 +1321,7 @@ async function processAccountInTab(context, accountLine, tabIndex, accountsCount
                 let status = 'unknown';
 
                 // Status checking logic
-                if (bodyText.includes(`A verification code has been sent to your email address`)) {
+                if (bodyText.includes(`A verification code has been sent to your`)) {
                     logger.info(`✅ Tab ${tabIndex + 1}: Good account - ${email} ${timeoutRetryCount > 0 ? `(after ${timeoutRetryCount} timeout retries)` : ''}`);
                     status = 'good';
                 }
@@ -1850,9 +2063,42 @@ async function processAccounts() {
 //     process.exit(1);
 // });
 
+process.on('SIGTERM', async () => {
+    console.log(`🛑 Graceful shutdown initiated for cluster ${globalBrowserManager.clusterId}...`);
+    try {
+        // فقط شمارنده این کلاستر را صفر کنید
+        const state = await globalBrowserManager.readState();
+        if (state.clusters[globalBrowserManager.clusterId]) {
+            const clusterCount = state.clusters[globalBrowserManager.clusterId].count;
+            for (let i = 0; i < clusterCount; i++) {
+                await globalBrowserManager.decrementBrowserCount();
+            }
+        }
+        console.log(`✅ Cluster ${globalBrowserManager.clusterId} shutdown completed`);
+    } catch (error) {
+        console.error('Shutdown cleanup error:', error.message);
+    }
+    process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+    console.log(`🛑 SIGINT received for cluster ${globalBrowserManager.clusterId}...`);
+    process.emit('SIGTERM');
+});
+
 
 export {
-    createNewProfile, processFakeAccountFirst, processAccountInTab, cleanupProfile, sleep, manageFingerprintQueue,
-    initializeFingerprintManager
-
+    createNewProfile,
+    processFakeAccountFirst,
+    processAccountInTab,
+    cleanupProfile,
+    sleep,
+    manageFingerprintQueue,
+    initializeFingerprintManager,
+    globalBrowserManager,
+    closeProfile,
+    cleanupOldProfiles,
+    initializeGlobalProfileManager,
+    startPeriodicCleanup,
+    showCurrentStats,
 };

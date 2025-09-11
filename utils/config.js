@@ -37,5 +37,7 @@ export const config = {
 
     // اطلاعات سرور
     SERVER_IP: SERVER_IP,
-    HOSTNAME: os.hostname()
+    HOSTNAME: os.hostname(),
+
+    MAX_CONCURRENT_BROWSERS: process.env.MAX_CONCURRENT_BROWSERS || 10
 };
