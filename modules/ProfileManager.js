@@ -23,6 +23,109 @@ export default class ProfileManager {
         this.maxRetries = Constants.MAX_RETRIES + 1;
     }
 
+    static activeProfiles = new Map();
+
+        static async createProfileWithRetry(proxy, maxRetries = 3) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                logger.info(`🔧 Creating profile (attempt ${attempt}/${maxRetries})...`);
+                
+                const profile = await this.createProfile(proxy);
+                
+                // Test profile connection
+                const context = await this.connectToProfile(profile);
+                await this.testProfileConnection(context);
+                
+                // Store profile info
+                this.activeProfiles.set(profile.id, {
+                    profile,
+                    context,
+                    createdAt: Date.now(),
+                    clusterId: process.env.pm_id
+                });
+                
+                return { profile, context };
+                
+            } catch (error) {
+                logger.error(`❌ Profile creation attempt ${attempt} failed: ${error.message}`);
+                
+                if (attempt < maxRetries) {
+                    // Wait before retry
+                    await HumanBehavior.sleep(5000 * attempt);
+                    
+                    // Try with new proxy if proxy error
+                    if (this.isProxyError(error.message)) {
+                        proxy = await ProxyManager.getWorkingProxy();
+                        logger.info(`🔄 Switching to new proxy: ${proxy}`);
+                    }
+                } else {
+                    throw error;
+                }
+            }
+        }
+    }
+
+        static async cleanupProfile(profileId) {
+        try {
+            const profileInfo = this.activeProfiles.get(profileId);
+            if (!profileInfo) return;
+
+            const { profile, context } = profileInfo;
+
+            // Close context first
+            if (context && context.browser && context.browser().isConnected()) {
+                await context.close();
+                logger.info(`🔒 Context closed for profile ${profileId}`);
+            }
+
+            // Wait a moment before deleting profile
+            await HumanBehavior.sleep(1000);
+
+            // Delete profile from Kameleo
+            await this.deleteProfile(profileId);
+            logger.info(`🗑️ Profile ${profileId} deleted`);
+
+            // Remove from active profiles
+            this.activeProfiles.delete(profileId);
+
+        } catch (error) {
+            logger.warn(`⚠️ Error cleaning up profile ${profileId}: ${error.message}`);
+        }
+    }
+
+
+        static async cleanupOldProfiles() {
+        const now = Date.now();
+        const maxAge = 5 * 60 * 1000; // 5 minutes
+
+        for (const [profileId, profileInfo] of this.activeProfiles.entries()) {
+            if (now - profileInfo.createdAt > maxAge) {
+                logger.info(`🧹 Cleaning up old profile: ${profileId}`);
+                await this.cleanupProfile(profileId);
+            }
+        }
+    }
+
+    // Start cleanup interval
+    static startCleanupInterval() {
+        setInterval(() => {
+            this.cleanupOldProfiles();
+        }, 2 * 60 * 1000); // Check every 2 minutes
+    }
+
+
+        static isProxyError(errorMessage) {
+        const proxyErrors = [
+            'Failed to determine external IP address',
+            'HTTP 503',
+            'net::ERR_PROXY_CONNECTION_FAILED',
+            'net::ERR_TUNNEL_CONNECTION_FAILED'
+        ];
+        
+        return proxyErrors.some(error => errorMessage.includes(error));
+    }
+
+
     // ==================== Profile Creation ====================
     async createProfile(proxy = null, cookies = [], retryCount = 0) {
         try {

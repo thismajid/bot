@@ -9,6 +9,45 @@ export default class ProxyManager {
         this.cookiesFile = Constants.COOKIES_FILE;
     }
 
+    static async testProxy(proxy) {
+        try {
+            const response = await fetch(`https://httpbin.org/${proxy.host}`, {
+                method: 'GET',
+                timeout: 10000,
+            });
+            
+            if (response.ok) {
+                logger.info(`✅ Proxy ${proxy} is working`);
+                return true;
+            }
+        } catch (error) {
+            logger.warn(`❌ Proxy ${proxy} failed: ${error.message}`);
+        }
+        return false;
+    }
+
+    static async getWorkingProxy(retries = 3) {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                const proxy = await this.requestProxyFromServer();
+                const isWorking = await this.testProxy(proxy);
+                
+                if (isWorking) {
+                    return proxy;
+                }
+                
+                logger.warn(`🔄 Proxy attempt ${attempt}/${retries} failed, trying next...`);
+                await HumanBehavior.sleep(2000 * attempt);
+                
+            } catch (error) {
+                logger.error(`❌ Proxy request attempt ${attempt} failed: ${error.message}`);
+            }
+        }
+        
+        throw new Error('No working proxy found after retries');
+    }
+    
+
     // ==================== Proxy Loading ====================
     async loadWorkingProxies() {
         try {

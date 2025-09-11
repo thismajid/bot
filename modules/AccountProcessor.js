@@ -8,15 +8,67 @@ import PageHelpers from './PageHelpers.js';
 export default class AccountProcessor {
     constructor(client) {
         this.client = client;
-        this.globalExitFlag = false; // instance flag
+        this.instanceExitFlag = false; // instance-specific flag
     }
 
-    static setGlobalExitFlag() {
-        this.globalExitFlag = true;
+    // Remove static methods and use instance methods
+    setInstanceExitFlag() {
+        this.instanceExitFlag = true;
+    }
+
+    getInstanceExitFlag() {
+        return this.instanceExitFlag;
+    }
+
+    // Global exit flag for true global conditions (optional)
+    static globalExitFlag = false;
+
+    // Check both instance and global flags
+    shouldExit() {
+        return this.instanceExitFlag || AccountProcessor.globalExitFlag;
+    }
+
+    // تبدیل به static property
+    static globalExitFlag = false;
+    static exitReason = null;
+    static exitTimestamp = null;
+    static exitClusterId = null;
+
+    static setGlobalExitFlag(reason = 'timeout', clusterId = null) {
+        if (!this.globalExitFlag) { // فقط اولین بار set کن
+            this.globalExitFlag = true;
+            this.exitReason = reason;
+            this.exitTimestamp = Date.now();
+            this.exitClusterId = clusterId;
+            console.log(`🛑 Global exit flag set by cluster ${clusterId}: ${reason}`);
+        }
     }
 
     static getGlobalExitFlag() {
         return this.globalExitFlag;
+    }
+
+    static resetGlobalExitFlag() {
+        const wasActive = this.globalExitFlag;
+        this.globalExitFlag = false;
+        this.exitReason = null;
+        this.exitTimestamp = null;
+        this.exitClusterId = null;
+
+        if (wasActive) {
+            console.log(`🔄 Global exit flag reset at ${new Date().toISOString()}`);
+        }
+        return wasActive;
+    }
+
+    static getExitInfo() {
+        return {
+            isActive: this.globalExitFlag,
+            reason: this.exitReason,
+            timestamp: this.exitTimestamp,
+            clusterId: this.exitClusterId,
+            ageInMinutes: this.exitTimestamp ? (Date.now() - this.exitTimestamp) / (1000 * 60) : 0
+        };
     }
 
     // ==================== Real Account Processing ====================
@@ -25,15 +77,15 @@ export default class AccountProcessor {
         const startTime = Date.now();
 
         try {
-            // چک کردن exit flag در ابتدا
-            if (AccountProcessor.getGlobalExitFlag()) {
-                logger.info(`🛑 Tab ${tabIndex + 1}: Global exit flag detected - Skipping processing`);
+            // Check both flags
+            if (this.shouldExit()) {
+                logger.info(`🛑 Tab ${tabIndex + 1}: Exit flag detected - Skipping processing`);
                 return {
                     email: accountLine.split(':')[0],
                     status: 'skipped-exit',
                     responseTime: Date.now() - startTime,
                     tabIndex,
-                    message: 'Skipped due to global exit condition'
+                    message: 'Skipped due to exit condition'
                 };
             }
 
@@ -59,16 +111,16 @@ export default class AccountProcessor {
 
             while (timeoutRetryCount <= Constants.MAX_TIMEOUT_RETRIES) {
                 try {
-                    // چک کردن exit flag در هر retry
-                    if (AccountProcessor.getGlobalExitFlag()) {
-                        logger.info(`🛑 Tab ${tabIndex + 1}: Global exit flag detected during retry - Stopping`);
+                    // Check exit flags in retry loop
+                    if (this.shouldExit()) {
+                        logger.info(`🛑 Tab ${tabIndex + 1}: Exit flag detected during retry - Stopping`);
                         return {
                             email,
                             status: 'stopped-exit',
                             responseTime: Date.now() - startTime,
                             tabIndex,
                             retryCount: timeoutRetryCount,
-                            message: 'Stopped due to global exit condition'
+                            message: 'Stopped due to exit condition'
                         };
                     }
 
@@ -87,23 +139,13 @@ export default class AccountProcessor {
                     finalResult = await this._processLogin(page, accountLine, tabIndex, startTime, timeoutRetryCount, accountsCount);
 
                     if (finalResult && finalResult.shouldExit) {
-                        logger.warn(`🛑 Tab ${tabIndex + 1}: EXIT CONDITION MET - Setting global exit flag`);
+                        logger.warn(`🛑 Tab ${tabIndex + 1}: EXIT CONDITION MET - Setting instance exit flag`);
 
-                        // Set کردن global exit flag
-                        AccountProcessor.setGlobalExitFlag();
+                        // Set only instance exit flag, not global
+                        this.setInstanceExitFlag();
 
-                        // بستن صفحه و context
-                        try {
-                            if (page && !page.isClosed()) {
-                                await page.close();
-                            }
-                            if (context && context.browser && context.browser().isConnected()) {
-                                await context.close();
-                                logger.info(`🔒 Profile context closed due to exit condition`);
-                            }
-                        } catch (closeErr) {
-                            logger.warn(`⚠️ Error during cleanup: ${closeErr.message}`);
-                        }
+                        // Close resources gracefully
+                        await this.gracefulCleanup(page, context);
 
                         return finalResult.result;
                     }
@@ -338,22 +380,34 @@ export default class AccountProcessor {
 
         const hasTimeoutMessage = await PageHelpers._hasTimeoutMessage(bodyText);
         logger.info(`🔍 Tab ${tabIndex + 1}: Debug - hasTimeoutMessage: ${hasTimeoutMessage}, tabIndex: ${tabIndex + 1}, accountsCount: ${accountsCount}`);
-        logger.info(`🔍 Tab ${tabIndex + 1}: Body text contains: ${bodyText.substring(0, 200)}...`);
 
         if (hasTimeoutMessage && accountsCount === tabIndex + 1) {
-            logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected on LAST account for ${email} - Should exit now!`);
+            logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected on LAST account for ${email}`);
 
-            return {
-                shouldExit: true,
-                result: {
-                    email,
-                    status: 'timeout-exit',
-                    responseTime: Date.now() - startTime,
-                    tabIndex,
-                    retryCount: timeoutRetryCount,
-                    message: 'Timeout detected on last account - Process terminated'
-                }
-            };
+            // تأخیر برای اطمینان
+            await HumanBehavior.sleep(3000);
+
+            // چک مجدد timeout message
+            const bodyTextRecheck = await page.evaluate(() => document.body?.innerText || "");
+            const hasTimeoutMessageRecheck = await PageHelpers._hasTimeoutMessage(bodyTextRecheck);
+
+            if (hasTimeoutMessageRecheck) {
+                logger.warn(`⚠️ Tab ${tabIndex + 1}: CONFIRMED timeout on last account - Setting exit flag`);
+
+                return {
+                    shouldExit: true,
+                    result: {
+                        email,
+                        status: 'timeout-exit',
+                        responseTime: Date.now() - startTime,
+                        tabIndex,
+                        retryCount: timeoutRetryCount,
+                        message: 'Timeout detected on last account - Process terminated'
+                    }
+                };
+            } else {
+                logger.info(`✅ Tab ${tabIndex + 1}: False alarm - Timeout message disappeared on recheck`);
+            }
         }
 
         await PageHelpers.waitFullLoadAndSettle(page);
@@ -585,5 +639,25 @@ export default class AccountProcessor {
         ];
 
         return proxyErrors.some(proxyError => errorMessage.includes(proxyError));
+    }
+
+    async gracefulCleanup(page, context) {
+        try {
+            if (page && !page.isClosed()) {
+                await page.close();
+                logger.info(`📄 Page closed successfully`);
+            }
+        } catch (pageErr) {
+            logger.warn(`⚠️ Error closing page: ${pageErr.message}`);
+        }
+
+        try {
+            if (context && context.browser && context.browser().isConnected()) {
+                await context.close();
+                logger.info(`🔒 Context closed successfully`);
+            }
+        } catch (contextErr) {
+            logger.warn(`⚠️ Error closing context: ${contextErr.message}`);
+        }
     }
 }

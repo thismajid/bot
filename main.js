@@ -133,6 +133,58 @@ async function processAccountInTab(context, accountLine, tabIndex, accountsCount
     return await processor.processAccount(context, accountLine, tabIndex, accountsCount, abortSignal);
 }
 
+
+class ExitFlagManager {
+    constructor() {
+        this.resetInterval = null;
+        this.healthInterval = null;
+        this.clusterId = globalBrowserManager.clusterId;
+        this.startAutoManagement();
+    }
+
+    startAutoManagement() {
+        // Auto-reset هر 15 دقیقه
+        this.resetInterval = setInterval(() => {
+            const exitInfo = AccountProcessor.getExitInfo();
+            
+            if (exitInfo.isActive && exitInfo.ageInMinutes > 15) {
+                logger.warn(`🔄 Auto-resetting exit flag after ${exitInfo.ageInMinutes.toFixed(2)} minutes`);
+                logger.warn(`📝 Original reason: ${exitInfo.reason} by cluster ${exitInfo.clusterId}`);
+                AccountProcessor.resetGlobalExitFlag();
+            }
+        }, 5 * 60 * 1000); // هر 5 دقیقه چک کن
+
+        // Health monitoring هر 2 دقیقه
+        this.healthInterval = setInterval(() => {
+            const exitInfo = AccountProcessor.getExitInfo();
+            
+            if (exitInfo.isActive) {
+                logger.info(`🏥 Exit Flag Status: ACTIVE for ${exitInfo.ageInMinutes.toFixed(1)} minutes`);
+                logger.info(`📝 Reason: ${exitInfo.reason} | Set by: Cluster ${exitInfo.clusterId}`);
+            }
+        }, 2 * 60 * 1000);
+    }
+
+    stop() {
+        if (this.resetInterval) {
+            clearInterval(this.resetInterval);
+        }
+        if (this.healthInterval) {
+            clearInterval(this.healthInterval);
+        }
+    }
+
+    manualReset() {
+        const wasReset = AccountProcessor.resetGlobalExitFlag();
+        if (wasReset) {
+            logger.info(`🔄 Manual reset by cluster ${this.clusterId}`);
+        } else {
+            logger.info(`ℹ️ Exit flag was already inactive`);
+        }
+        return wasReset;
+    }
+}
+
 // ==================== PSNInstance Class ====================
 class PSNInstance {
     constructor() {
@@ -155,6 +207,9 @@ class PSNInstance {
             profilesClosed: 0,
             browserErrors: 0
         };
+
+          
+        this.exitFlagManager = null;
     }
 
     // ==================== Socket Management ====================
@@ -258,6 +313,106 @@ class PSNInstance {
         logger.info(`📝 Registering instance with capabilities: ${JSON.stringify(registrationData.capabilities)}`);
         this.socket.emit("register-instance", registrationData);
     }
+
+        async start() {
+        logger.info(`🚀 Starting PSN Instance: ${this.instanceId}`);
+        logger.info(`📡 Server URL: ${this.serverUrl}`);
+        config.display();
+
+        try {
+            logger.info('🔧 Initializing global browser manager...');
+            await initializeGlobalProfileManager();
+
+            // Reset exit flag در شروع
+            const wasReset = AccountProcessor.resetGlobalExitFlag();
+            if (wasReset) {
+                logger.info('🔄 Reset existing exit flag on startup');
+            }
+
+            // Initialize exit flag manager
+            this.exitFlagManager = new ExitFlagManager();
+            logger.info('🛡️ Exit flag manager initialized');
+
+            if (globalBrowserManager.clusterId === '0' || !globalBrowserManager.clusterId) {
+                startPeriodicCleanup(10);
+                logger.info('🧹 Periodic cleanup started (master cluster)');
+            }
+
+            await showCurrentStats();
+            logger.info(`✅ Global browser manager initialized for cluster ${globalBrowserManager.clusterId}`);
+
+        } catch (initError) {
+            logger.error(`❌ Failed to initialize global browser manager: ${initError.message}`);
+        }
+
+        this.initSocket();
+        this.startHeartbeat();
+        this.startStatsDisplay();
+
+        // اضافه کردن signal handlers برای manual reset
+        this.setupSignalHandlers();
+
+        process.on('SIGINT', () => this.gracefulShutdown('SIGINT'));
+        process.on('SIGTERM', () => this.gracefulShutdown('SIGTERM'));
+
+        process.on('uncaughtException', (error) => {
+            logger.error(`💥 Uncaught Exception: ${error.message}`, error);
+            this.reportError(error, { type: 'uncaughtException' });
+        });
+
+        process.on('unhandledRejection', (reason, promise) => {
+            logger.error(`💥 Unhandled Rejection: ${reason}`, { promise });
+            this.reportError(new Error(reason), { type: 'unhandledRejection' });
+        });
+
+        logger.info('✅ PSN Instance started successfully');
+    }
+
+        setupSignalHandlers() {
+        // SIGUSR1 برای manual reset
+        process.on('SIGUSR1', () => {
+            logger.info('🔄 Received SIGUSR1 - Manual exit flag reset requested');
+            if (this.exitFlagManager) {
+                this.exitFlagManager.manualReset();
+            }
+        });
+
+        // برای Windows - stdin commands
+        if (process.platform === 'win32') {
+            const readline = require('readline');
+            const rl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout
+            });
+
+            rl.on('line', (input) => {
+                const command = input.trim().toLowerCase();
+                
+                switch (command) {
+                    case 'reset':
+                    case 'reset-exit':
+                        logger.info('🔄 Manual reset command received via stdin');
+                        if (this.exitFlagManager) {
+                            this.exitFlagManager.manualReset();
+                        }
+                        break;
+                        
+                    case 'status':
+                    case 'exit-status':
+                        const exitInfo = AccountProcessor.getExitInfo();
+                        logger.info('📊 Exit Flag Status:', exitInfo);
+                        break;
+                        
+                    case 'help':
+                        logger.info('Available commands: reset, status, help');
+                        break;
+                }
+            });
+        }
+    }
+
+
+
 
     // ==================== Resource Requests ====================
     async requestProxy() {
@@ -564,6 +719,29 @@ class PSNInstance {
     async processAccountsInParallel(context, accounts) {
         logger.info(`🚀 Starting parallel processing of ${accounts.length} accounts...`);
 
+        // چک exit flag قبل از شروع
+        if (AccountProcessor.getGlobalExitFlag()) {
+            logger.warn('🛑 Global exit flag is active - Skipping all accounts');
+            const skippedResults = accounts.map((account, index) => ({
+                id: account.id,
+                email: account.email,
+                password: account.password,
+                status: 'skipped-exit',
+                error: 'Global exit flag was active',
+                responseTime: 0,
+                tabIndex: index,
+                shouldExit: false
+            }));
+
+            return {
+                finalResults: skippedResults,
+                exitTriggered: true,
+                totalProcessed: skippedResults.length,
+                successCount: 0,
+                errorCount: skippedResults.length
+            };
+        }
+
         const abortController = new AbortController();
         let shouldExitGlobal = false;
         const completedResults = [];
@@ -574,6 +752,25 @@ class PSNInstance {
             if (startDelay > 0) {
                 logger.info(`⏳ Account ${account.email} waiting ${startDelay}ms before start...`);
                 await sleep(startDelay);
+            }
+
+            // چک exit flag قبل از پردازش هر اکانت
+            if (AccountProcessor.getGlobalExitFlag()) {
+                logger.info(`🛑 Account ${account.email} skipped - Global exit flag detected`);
+                return {
+                    type: 'skipped',
+                    result: {
+                        id: account.id,
+                        email: account.email,
+                        password: account.password,
+                        status: 'skipped-exit',
+                        error: 'Global exit flag detected before processing',
+                        responseTime: 0,
+                        tabIndex: index
+                    },
+                    account,
+                    index
+                };
             }
 
             if (abortController.signal.aborted) {
@@ -592,6 +789,11 @@ class PSNInstance {
                     accounts.length,
                     abortController.signal
                 );
+
+                // اگر exit condition برگشت، global flag را set کن
+                if (result.shouldExit) {
+                    AccountProcessor.setGlobalExitFlag('timeout-detected', globalBrowserManager.clusterId);
+                }
 
                 const accountResult = {
                     id: account.id,
@@ -654,7 +856,7 @@ class PSNInstance {
                     abortController.abort();
                     completedResults.push(result.result);
                     break;
-                } else if (result.type === 'completed') {
+                } else if (result.type === 'completed' || result.type === 'skipped') {
                     logger.info(`✅ Account ${result.index + 1} completed: ${result.result.email} → ${result.result.status}`);
                     completedResults.push(result.result);
                 } else if (result.type === 'error') {
@@ -682,7 +884,7 @@ class PSNInstance {
             });
         }
 
-        const successCount = completedResults.filter(r => !['error', 'server-error', 'timeout-error'].includes(r.status)).length;
+        const successCount = completedResults.filter(r => !['error', 'server-error', 'timeout-error', 'skipped-exit'].includes(r.status)).length;
         const errorCount = completedResults.length - successCount;
 
         logger.info(`📈 Final summary: ${successCount} success, ${errorCount} errors, Total: ${completedResults.length}`);
@@ -871,12 +1073,17 @@ class PSNInstance {
         logger.info('✅ PSN Instance started successfully');
     }
 
-    async gracefulShutdown(signal) {
+ async gracefulShutdown(signal) {
         logger.info(`🛑 Received ${signal}, shutting down gracefully...`);
 
         this.isProcessing = false;
         this.connected = false;
         this.registered = false;
+
+        // Stop exit flag manager
+        if (this.exitFlagManager) {
+            this.exitFlagManager.stop();
+        }
 
         try {
             logger.info(`🧹 Cleaning up cluster ${globalBrowserManager.clusterId} browser count...`);
