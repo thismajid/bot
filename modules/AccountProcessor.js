@@ -307,8 +307,6 @@ export default class AccountProcessor {
     }
 
     _determineLoginStatus(bodyText) {
-        console.log('zzz   ', bodyText);
-
         const statusChecks = [
             { text: 'A verification code has been sent to your', status: 'good' },
             { text: 'Two-factor authentication', status: '2fa' },
