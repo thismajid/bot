@@ -1,11 +1,8 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
-import path from "node:path";
-import axios from 'axios';
 import { logger } from "../utils/logger.js";
 import Constants from './Constants.js';
 import HumanBehavior from './HumanBehavior.js';
-import FakeAccountGenerator from './FakeAccountGenerator.js';
 import PageHelpers from './PageHelpers.js';
 
 export default class AccountProcessor {
@@ -19,10 +16,14 @@ export default class AccountProcessor {
         const startTime = Date.now();
 
         try {
+            // بررسی context قبل از شروع
+            if (!context || !context.browser() || !context.browser().isConnected()) {
+                throw new Error("Browser context is not available or disconnected");
+            }
+
             logger.info(`🚀 Tab ${tabIndex + 1}: Starting login for ${accountLine}`);
             const email = accountLine.split(':')[0];
 
-            // ✅ اصلاح: استفاده از page به جای ret
             page = await this._createAndLoadPage(context, tabIndex, email);
 
             let timeoutRetryCount = 0;
@@ -30,6 +31,12 @@ export default class AccountProcessor {
 
             while (timeoutRetryCount <= Constants.MAX_TIMEOUT_RETRIES) {
                 try {
+                    // بررسی page قبل از هر retry
+                    if (page.isClosed()) {
+                        logger.warn(`⚠️ Tab ${tabIndex + 1}: Page was closed, creating new one...`);
+                        page = await this._createAndLoadPage(context, tabIndex, email);
+                    }
+
                     if (timeoutRetryCount === 0) {
                         await this._initialPageSetup(page, tabIndex);
                     } else {
@@ -38,7 +45,7 @@ export default class AccountProcessor {
 
                     finalResult = await this._processLogin(page, accountLine, tabIndex, startTime, timeoutRetryCount, accountsCount);
 
-                    if (finalResult.shouldExit) {
+                    if (finalResult && finalResult.shouldExit) {
                         return finalResult.result;
                     }
 
@@ -46,6 +53,20 @@ export default class AccountProcessor {
 
                 } catch (retryErr) {
                     logger.error(`❌ Tab ${tabIndex + 1}: Error during retry ${timeoutRetryCount} for ${email}: ${retryErr.message}`);
+
+                    // اگر خطا مربوط به بسته شدن page است، سعی کن page جدید بسازی
+                    if (retryErr.message.includes('closed') || retryErr.message.includes('Target page')) {
+                        try {
+                            if (page && !page.isClosed()) {
+                                await page.close();
+                            }
+                            page = await this._createAndLoadPage(context, tabIndex, email);
+                            logger.info(`🔄 Tab ${tabIndex + 1}: Created new page after closure`);
+                        } catch (pageCreateErr) {
+                            logger.error(`❌ Tab ${tabIndex + 1}: Failed to create new page: ${pageCreateErr.message}`);
+                            break;
+                        }
+                    }
 
                     timeoutRetryCount++;
                     if (timeoutRetryCount > Constants.MAX_TIMEOUT_RETRIES) {
@@ -74,7 +95,6 @@ export default class AccountProcessor {
                 tabIndex
             };
         } finally {
-            // ✅ اصلاح: اطمینان از بسته شدن صحیح صفحه
             if (page && !page.isClosed()) {
                 try {
                     await page.close();
@@ -91,38 +111,44 @@ export default class AccountProcessor {
 
         for (let attempt = 1; attempt <= Constants.MAX_RETRIES; attempt++) {
             try {
-                await HumanBehavior.sleep(HumanBehavior.randomDelay(50, 250));
+                // بررسی context قبل از ایجاد page جدید
+                if (context.browser() && context.browser().isConnected && context.browser().isConnected()) {
+                    await HumanBehavior.sleep(HumanBehavior.randomDelay(50, 250));
 
-                // ✅ اصلاح: ایجاد صفحه جدید با مدیریت بهتر خطا
-                page = await context.newPage();
+                    page = await context.newPage();
 
-                // ✅ اصلاح: تنظیم viewport با استفاده از page به جای ret
-                await page.setViewportSize({
-                    width: 1200 + (tabIndex * 50),
-                    height: 800 + (tabIndex * 30)
-                });
+                    await page.setViewportSize({
+                        width: 1200 + (tabIndex * 50),
+                        height: 800 + (tabIndex * 30)
+                    });
 
-                logger.info(`📄 Tab ${tabIndex + 1}: Loading page (attempt ${attempt}/${Constants.MAX_RETRIES})...`);
+                    logger.info(`📄 Tab ${tabIndex + 1}: Loading page (attempt ${attempt}/${Constants.MAX_RETRIES})...`);
 
-                // ✅ بهبود: تنظیم timeout برای navigation
-                await page.goto(Constants.LOGIN_URL, {
-                    waitUntil: "domcontentloaded",
-                    timeout: Constants.PAGE_LOAD_TIMEOUT
-                });
+                    // افزایش timeout و تغییر waitUntil
+                    await page.goto(Constants.LOGIN_URL, {
+                        waitUntil: "domcontentloaded", // تغییر از networkidle به domcontentloaded
+                        timeout: 45000 // افزایش timeout به 45 ثانیه
+                    });
 
-                // ✅ بهبود: چک کردن محتوای صفحه
-                const pageLoaded = await PageHelpers.waitForPageContent(page, 'Sign in to PlayStation', 25000, tabIndex + 1);
-                if (!pageLoaded) {
-                    throw new Error("Page did not load properly");
+                    // بررسی اینکه page هنوز باز است
+                    if (page.isClosed()) {
+                        throw new Error("Page was closed after goto");
+                    }
+
+                    const pageLoaded = await PageHelpers.waitForPageContent(page, 'Sign in to PlayStation', 25000, tabIndex + 1);
+                    if (!pageLoaded) {
+                        throw new Error("Page did not load properly");
+                    }
+
+                    logger.info(`Tab ${tabIndex + 1}: ✅ Page loaded successfully!`);
+                    return page;
+                } else {
+                    throw new Error("Browser context is not connected");
                 }
-
-                logger.info(`Tab ${tabIndex + 1}: ✅ Page loaded successfully!`);
-                return page;
 
             } catch (gotoErr) {
                 logger.error(`Tab ${tabIndex + 1}: Page load attempt ${attempt} failed: ${gotoErr.message}`);
 
-                // ✅ اصلاح: بستن صفحه ناموفق
                 if (page && !page.isClosed()) {
                     try {
                         await page.close();
@@ -135,7 +161,8 @@ export default class AccountProcessor {
                     throw new Error('PAGE_LOAD_FAILED');
                 }
 
-                await HumanBehavior.sleep(2000 * attempt + HumanBehavior.randomDelay(250, 750));
+                // افزایش تأخیر بین تلاش‌ها
+                await HumanBehavior.sleep(5000 * attempt + HumanBehavior.randomDelay(1000, 2000));
             }
         }
     }
@@ -153,7 +180,6 @@ export default class AccountProcessor {
     async _refreshPageForRetry(page, tabIndex) {
         logger.info(`🔄 Tab ${tabIndex + 1}: Refreshing page due to timeout (retry)...`);
 
-        // ✅ بهبود: چک کردن وضعیت صفحه قبل از reload
         if (page.isClosed()) {
             throw new Error("Page is already closed, cannot refresh");
         }
@@ -182,7 +208,6 @@ export default class AccountProcessor {
         const email = accountLine.split(':')[0];
         const submitSelector = "button[type=submit]";
 
-        // ✅ بهبود: چک کردن وضعیت صفحه
         if (page.isClosed()) {
             throw new Error("Page is closed, cannot process login");
         }
@@ -229,33 +254,17 @@ export default class AccountProcessor {
         if (await PageHelpers._hasTimeoutMessage(bodyText) && accountsCount === tabIndex + 1) {
             logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected for ${email}`);
 
-            if (timeoutRetryCount >= Constants.MAX_TIMEOUT_RETRIES) {
-                console.log({
-                    shouldExit: true,
-                    result: {
-                        email,
-                        status: 'timeout-error',
-                        responseTime: Date.now() - startTime,
-                        tabIndex,
-                        retryCount: timeoutRetryCount,
-                        message: 'Max timeout retries exceeded'
-                    }
-                });
-
-                return {
-                    shouldExit: true,
-                    result: {
-                        email,
-                        status: 'timeout-error',
-                        responseTime: Date.now() - startTime,
-                        tabIndex,
-                        retryCount: timeoutRetryCount,
-                        message: 'Max timeout retries exceeded'
-                    }
-                };
-            }
-
-            throw new Error('Timeout detected, retrying...');
+            return {
+                shouldExit: true,
+                result: {
+                    email,
+                    status: 'timeout-exit',
+                    responseTime: Date.now() - startTime,
+                    tabIndex,
+                    retryCount: timeoutRetryCount,
+                    message: 'Timeout detected on last account - Process terminated'
+                }
+            };
         }
 
         await PageHelpers.waitFullLoadAndSettle(page);
@@ -265,7 +274,7 @@ export default class AccountProcessor {
         const status = this._determineLoginStatus(bodyText);
 
         const responseTime = Date.now() - startTime;
-        logger.info(`⏱️ Tab ${tabIndex + 1}: Processing completed in ${responseTime}ms ${timeoutRetryCount > 0 ? `(with ${timeoutRetryCount} timeout retries)` : ''}`);
+        logger.info(`⏱️ Tab ${tabIndex + 1}: Processing completed in ${responseTime}ms with status ${status} - ${timeoutRetryCount > 0 ? `(with ${timeoutRetryCount} timeout retries)` : ''}`);
 
         return {
             email,
@@ -284,7 +293,6 @@ export default class AccountProcessor {
 
     async _takeScreenshot(page, email, tabIndex, timeoutRetryCount) {
         try {
-            // ✅ بهبود: چک کردن وضعیت صفحه قبل از screenshot
             if (page.isClosed()) {
                 logger.warn(`⚠️ Tab ${tabIndex + 1}: Cannot take screenshot, page is closed`);
                 return null;
@@ -299,8 +307,9 @@ export default class AccountProcessor {
     }
 
     _determineLoginStatus(bodyText) {
+        console.log('zzz   ', bodyText);
+
         const statusChecks = [
-            { text: 'Sign in to PlayStation', status: 'login-page' },
             { text: 'A verification code has been sent to your', status: 'good' },
             { text: 'Two-factor authentication', status: '2fa' },
             { text: 'verification code', status: '2fa' },
@@ -440,7 +449,10 @@ export default class AccountProcessor {
                 count: results.length
             };
 
-            await fs.appendFile(Constants.RESULTS_FILE, JSON.stringify(logEntry) + '\n', 'utf8');
+            const logData = JSON.stringify(logEntry) + '\n';
+
+            // استفاده از appendFile برای اضافه کردن به انتهای فایل
+            await fs.appendFile(Constants.RESULTS_FILE, logData, 'utf8');
 
         } catch (error) {
             console.log(`❌ Error sending results to server: ${error.message}`);
@@ -453,7 +465,12 @@ export default class AccountProcessor {
                 error: error.message
             };
 
-            await fs.appendFile(Constants.RESULTS_FILE, JSON.stringify(logEntry) + '\n', 'utf8');
+            try {
+                const logData = JSON.stringify(logEntry) + '\n';
+                await fs.appendFile(Constants.RESULTS_FILE, logData, 'utf8');
+            } catch (writeError) {
+                console.log(`❌ Failed to write error log: ${writeError.message}`);
+            }
         }
     }
 

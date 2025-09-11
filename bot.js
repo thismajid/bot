@@ -1,23 +1,14 @@
 import { KameleoLocalApiClient } from "@kameleo/local-api-client";
-import { chromium } from "playwright";
-import fs from "node:fs/promises";
-import fsSync from "node:fs";
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
-import path from "node:path";
-import { logger } from "./utils/logger.js";
-import axios from 'axios';
 import FingerprintManager from "./FingerprintManager.js";
 import FileBrowserManager from "./FileBrowserManager.js";
-import { config } from "./utils/config.js";
-import { 
+import {
     Constants,
     HumanBehavior,
-    FakeAccountGenerator,
     ProxyManager,
     ProfileManager,
     AccountProcessor,
-    PageHelpers
 } from "./modules/index.js";
 
 // ==================== Global Initialization ====================
@@ -25,8 +16,8 @@ const globalBrowserManager = new FileBrowserManager();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const client = new KameleoLocalApiClient({ 
-    basePath: `http://localhost:${Constants.KAMELEO_PORT}` 
+const client = new KameleoLocalApiClient({
+    basePath: `http://localhost:${Constants.KAMELEO_PORT}`
 });
 
 let fingerprintManager = null;
@@ -51,7 +42,7 @@ async function selectBalancedFingerprint() {
     } catch (err) {
         console.log("❌ Error selecting balanced fingerprint:", err.message);
         console.log("🔄 Falling back to random selection...");
-        
+
         const fingerprints = await client.fingerprint.searchFingerprints("desktop", "windows", "chrome", "139");
         const windowsFingerprints = fingerprints.filter(item => item.os.version === '11');
         return windowsFingerprints[Math.floor(Math.random() * windowsFingerprints.length)];
@@ -219,7 +210,7 @@ async function processAccountBatch(accountBatch) {
                 shouldStopProcessing = true;
 
                 await AccountProcessor.sendResultsToServer([firstResult]);
-                
+
                 if (usedProxy) {
                     console.log(`❌ Removing problematic proxy: ${usedProxy.host}:${usedProxy.port}`);
                     await proxyManager.removeUsedWorkingProxy(usedProxy);
@@ -241,7 +232,7 @@ async function processAccountBatch(accountBatch) {
             };
 
             await AccountProcessor.sendResultsToServer([errorResult]);
-            
+
             if (usedProxy) {
                 await proxyManager.removeUsedWorkingProxy(usedProxy);
             }
@@ -253,7 +244,7 @@ async function processAccountBatch(accountBatch) {
         // Process all results if first account was successful
         if (!shouldStopProcessing) {
             console.log(`✅ First account successful - processing all results...`);
-            
+
             let proxyIssueDetected = false;
             let serverErrorCount = 0;
             const processedResults = [];
@@ -325,7 +316,7 @@ async function main() {
         while (true) {
             try {
                 const accountBatch = await AccountProcessor.loadAccountBatch(Constants.CONCURRENT_TABS);
-                
+
                 if (accountBatch.length === 0) {
                     console.log("📭 No accounts to process. Waiting...");
                     await HumanBehavior.sleep(30000);

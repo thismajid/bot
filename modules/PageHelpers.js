@@ -1,4 +1,5 @@
 import path from "node:path";
+import fsSync from "node:fs";
 import HumanBehavior from "./HumanBehavior.js";
 import Constants from "./Constants.js";
 
@@ -7,11 +8,11 @@ export default class PageHelpers {
     // ==================== Page Loading and Waiting ====================
     static async waitFullLoadAndSettle(page, extraMs = Constants.PAGE_SETTLE_EXTRA_MS) {
         if (Constants.WAIT_FOR_FULL_LOAD) {
-            try { 
-                await page.waitForLoadState("load", { timeout: 15000 }); 
+            try {
+                await page.waitForLoadState("load", { timeout: 15000 });
             } catch { }
         }
-        
+
         await HumanBehavior.sleep(extraMs);
         await HumanBehavior.randomMouseMovements(page);
         await HumanBehavior.randomScroll(page);
@@ -107,11 +108,11 @@ export default class PageHelpers {
 
     static _hasTimeoutMessage(pageContent) {
         const timeoutMessages = [
-            'The connection to the server timed out.',
-            'connect to the server',
+            'The connection to the server timed out',
+            `Can't connect to the server`,
             'device sent too many requests'
         ];
-        
+
         return timeoutMessages.some(message => pageContent.includes(message));
     }
 
@@ -119,11 +120,11 @@ export default class PageHelpers {
     static async safeClickMayNavigate(page, frame, selector, navTimeout = 8000) {
         await HumanBehavior.hoverElement(page, selector);
 
-        const nav = page.waitForNavigation({ 
-            waitUntil: "load", 
-            timeout: navTimeout 
+        const nav = page.waitForNavigation({
+            waitUntil: "load",
+            timeout: navTimeout
         }).catch(() => null);
-        
+
         const click = HumanBehavior.humanClick(page, selector);
         await Promise.all([click, nav]);
         await this.waitFullLoadAndSettle(page);
@@ -179,19 +180,19 @@ export default class PageHelpers {
     static async takeAdvancedScreenshot(page, filename) {
         try {
             const screenshotsDir = path.join(process.cwd(), 'screenshots');
-            
+
             // Ensure screenshots directory exists
             if (!fsSync.existsSync(screenshotsDir)) {
-                await fs.mkdir(screenshotsDir, { recursive: true });
+                await fsSync.mkdir(screenshotsDir, { recursive: true });
             }
-            
+
             const screenshotPath = path.join(screenshotsDir, filename);
-            await page.screenshot({ 
-                path: screenshotPath, 
+            await page.screenshot({
+                path: screenshotPath,
                 fullPage: true,
                 quality: 80
             });
-            
+
             return screenshotPath;
         } catch (screenshotErr) {
             console.log(`⚠️ Screenshot failed: ${screenshotErr.message}`);
