@@ -16,7 +16,7 @@ export default class AccountProcessor {
         const startTime = Date.now();
 
         try {
-            // بررسی context قبل از شروع
+            // Check context before starting
             if (!context || !context.browser() || !context.browser().isConnected()) {
                 throw new Error("Browser context is not available or disconnected");
             }
@@ -31,7 +31,7 @@ export default class AccountProcessor {
 
             while (timeoutRetryCount <= Constants.MAX_TIMEOUT_RETRIES) {
                 try {
-                    // بررسی page قبل از هر retry
+                    // Check page before each retry
                     if (page.isClosed()) {
                         logger.warn(`⚠️ Tab ${tabIndex + 1}: Page was closed, creating new one...`);
                         page = await this._createAndLoadPage(context, tabIndex, email);
@@ -54,7 +54,7 @@ export default class AccountProcessor {
                 } catch (retryErr) {
                     logger.error(`❌ Tab ${tabIndex + 1}: Error during retry ${timeoutRetryCount} for ${email}: ${retryErr.message}`);
 
-                    // اگر خطا مربوط به بسته شدن page است، سعی کن page جدید بسازی
+                    // If error is related to page closure, try to create a new page
                     if (retryErr.message.includes('closed') || retryErr.message.includes('Target page')) {
                         try {
                             if (page && !page.isClosed()) {
@@ -111,7 +111,7 @@ export default class AccountProcessor {
 
         for (let attempt = 1; attempt <= Constants.MAX_RETRIES; attempt++) {
             try {
-                // بررسی context قبل از ایجاد page جدید
+                // Check context before creating new page
                 if (context.browser() && context.browser().isConnected && context.browser().isConnected()) {
                     await HumanBehavior.sleep(HumanBehavior.randomDelay(50, 250));
 
@@ -124,13 +124,13 @@ export default class AccountProcessor {
 
                     logger.info(`📄 Tab ${tabIndex + 1}: Loading page (attempt ${attempt}/${Constants.MAX_RETRIES})...`);
 
-                    // افزایش timeout و تغییر waitUntil
+                    // Increase timeout and change waitUntil
                     await page.goto(Constants.LOGIN_URL, {
-                        waitUntil: "domcontentloaded", // تغییر از networkidle به domcontentloaded
-                        timeout: 45000 // افزایش timeout به 45 ثانیه
+                        waitUntil: "domcontentloaded", // Changed from networkidle to domcontentloaded
+                        timeout: Constants.PAGE_LOAD_TIMEOUT // Increased timeout to 45 seconds
                     });
 
-                    // بررسی اینکه page هنوز باز است
+                    // Check if page is still open
                     if (page.isClosed()) {
                         throw new Error("Page was closed after goto");
                     }
@@ -161,7 +161,7 @@ export default class AccountProcessor {
                     throw new Error('PAGE_LOAD_FAILED');
                 }
 
-                // افزایش تأخیر بین تلاش‌ها
+                // Increase delay between attempts
                 await HumanBehavior.sleep(5000 * attempt + HumanBehavior.randomDelay(1000, 2000));
             }
         }
@@ -451,7 +451,7 @@ export default class AccountProcessor {
 
             const logData = JSON.stringify(logEntry) + '\n';
 
-            // استفاده از appendFile برای اضافه کردن به انتهای فایل
+            // Use appendFile to add to end of file
             await fs.appendFile(Constants.RESULTS_FILE, logData, 'utf8');
 
         } catch (error) {
