@@ -8,6 +8,15 @@ import PageHelpers from './PageHelpers.js';
 export default class AccountProcessor {
     constructor(client) {
         this.client = client;
+        this.globalExitFlag = false; // instance flag
+    }
+
+    static setGlobalExitFlag() {
+        this.globalExitFlag = true;
+    }
+
+    static getGlobalExitFlag() {
+        return this.globalExitFlag;
     }
 
     // ==================== Real Account Processing ====================
@@ -16,25 +25,57 @@ export default class AccountProcessor {
         const startTime = Date.now();
 
         try {
-            // Check context before starting
+            // چک کردن exit flag در ابتدا
+            if (AccountProcessor.getGlobalExitFlag()) {
+                logger.info(`🛑 Tab ${tabIndex + 1}: Global exit flag detected - Skipping processing`);
+                return {
+                    email: accountLine.split(':')[0],
+                    status: 'skipped-exit',
+                    responseTime: Date.now() - startTime,
+                    tabIndex,
+                    message: 'Skipped due to global exit condition'
+                };
+            }
+
+            // چک کردن context قبل از شروع
             if (!context || !context.browser() || !context.browser().isConnected()) {
-                throw new Error("Browser context is not available or disconnected");
+                logger.warn(`⚠️ Tab ${tabIndex + 1}: Browser context is not available - Likely closed by another tab`);
+                return {
+                    email: accountLine.split(':')[0],
+                    status: 'context-closed',
+                    responseTime: Date.now() - startTime,
+                    tabIndex,
+                    message: 'Context was closed by exit condition'
+                };
             }
 
             logger.info(`🚀 Tab ${tabIndex + 1}: Starting login for ${accountLine}`);
             const email = accountLine.split(':')[0];
 
-            page = await this._createAndLoadPage(context, tabIndex, email);
+            page = await this._createAndLoadPage(context, accountLine, tabIndex, email);
 
             let timeoutRetryCount = 0;
             let finalResult = null;
 
             while (timeoutRetryCount <= Constants.MAX_TIMEOUT_RETRIES) {
                 try {
-                    // Check page before each retry
+                    // چک کردن exit flag در هر retry
+                    if (AccountProcessor.getGlobalExitFlag()) {
+                        logger.info(`🛑 Tab ${tabIndex + 1}: Global exit flag detected during retry - Stopping`);
+                        return {
+                            email,
+                            status: 'stopped-exit',
+                            responseTime: Date.now() - startTime,
+                            tabIndex,
+                            retryCount: timeoutRetryCount,
+                            message: 'Stopped due to global exit condition'
+                        };
+                    }
+
+                    // چک کردن page قبل از هر retry
                     if (page.isClosed()) {
                         logger.warn(`⚠️ Tab ${tabIndex + 1}: Page was closed, creating new one...`);
-                        page = await this._createAndLoadPage(context, tabIndex, email);
+                        page = await this._createAndLoadPage(context, accountLine, tabIndex, email);
                     }
 
                     if (timeoutRetryCount === 0) {
@@ -46,12 +87,43 @@ export default class AccountProcessor {
                     finalResult = await this._processLogin(page, accountLine, tabIndex, startTime, timeoutRetryCount, accountsCount);
 
                     if (finalResult && finalResult.shouldExit) {
+                        logger.warn(`🛑 Tab ${tabIndex + 1}: EXIT CONDITION MET - Setting global exit flag`);
+
+                        // Set کردن global exit flag
+                        AccountProcessor.setGlobalExitFlag();
+
+                        // بستن صفحه و context
+                        try {
+                            if (page && !page.isClosed()) {
+                                await page.close();
+                            }
+                            if (context && context.browser && context.browser().isConnected()) {
+                                await context.close();
+                                logger.info(`🔒 Profile context closed due to exit condition`);
+                            }
+                        } catch (closeErr) {
+                            logger.warn(`⚠️ Error during cleanup: ${closeErr.message}`);
+                        }
+
                         return finalResult.result;
                     }
 
                     if (finalResult) break;
 
                 } catch (retryErr) {
+                    // چک کردن اگر خطا به دلیل بسته شدن context است
+                    if (retryErr.message.includes('Target page, context or browser has been closed')) {
+                        logger.info(`🔒 Tab ${tabIndex + 1}: Context closed by exit condition - Stopping gracefully`);
+                        return {
+                            email,
+                            status: 'context-closed-exit',
+                            responseTime: Date.now() - startTime,
+                            tabIndex,
+                            retryCount: timeoutRetryCount,
+                            message: 'Context closed due to exit condition'
+                        };
+                    }
+
                     logger.error(`❌ Tab ${tabIndex + 1}: Error during retry ${timeoutRetryCount} for ${email}: ${retryErr.message}`);
 
                     // If error is related to page closure, try to create a new page
@@ -60,7 +132,7 @@ export default class AccountProcessor {
                             if (page && !page.isClosed()) {
                                 await page.close();
                             }
-                            page = await this._createAndLoadPage(context, tabIndex, email);
+                            page = await this._createAndLoadPage(context, accountLine, tabIndex, email);
                             logger.info(`🔄 Tab ${tabIndex + 1}: Created new page after closure`);
                         } catch (pageCreateErr) {
                             logger.error(`❌ Tab ${tabIndex + 1}: Failed to create new page: ${pageCreateErr.message}`);
@@ -86,6 +158,19 @@ export default class AccountProcessor {
             return finalResult;
 
         } catch (err) {
+            // چک کردن اگر خطا به دلیل بسته شدن context است
+            if (err.message.includes('Target page, context or browser has been closed') ||
+                err.message.includes('Browser context is not available')) {
+                logger.info(`🔒 Tab ${tabIndex + 1}: Context closed by exit condition - Handling gracefully`);
+                return {
+                    email: accountLine.split(':')[0],
+                    status: 'context-closed-exit',
+                    responseTime: Date.now() - startTime,
+                    tabIndex,
+                    message: 'Context closed due to exit condition'
+                };
+            }
+
             logger.error(`❌ Tab ${tabIndex + 1}: Fatal error: ${err.message}`);
             return {
                 email: accountLine.split(':')[0],
@@ -111,26 +196,26 @@ export default class AccountProcessor {
 
         for (let attempt = 1; attempt <= Constants.MAX_RETRIES; attempt++) {
             try {
-                // Check context before creating new page
+                // بررسی context قبل از ایجاد page جدید
                 if (context.browser() && context.browser().isConnected && context.browser().isConnected()) {
                     await HumanBehavior.sleep(HumanBehavior.randomDelay(50, 250));
 
                     page = await context.newPage();
 
                     await page.setViewportSize({
-                        width: 1200 + (tabIndex * 50),
-                        height: 800 + (tabIndex * 30)
+                        width: 1200,
+                        height: 800
                     });
 
                     logger.info(`📄 Tab ${tabIndex + 1}: Loading page (attempt ${attempt}/${Constants.MAX_RETRIES})...`);
 
-                    // Increase timeout and change waitUntil
+                    // افزایش timeout و تغییر waitUntil
                     await page.goto(Constants.LOGIN_URL, {
-                        waitUntil: "domcontentloaded", // Changed from networkidle to domcontentloaded
-                        timeout: Constants.PAGE_LOAD_TIMEOUT // Increased timeout to 45 seconds
+                        waitUntil: "domcontentloaded", // تغییر از networkidle به domcontentloaded
+                        timeout: 45000 // افزایش timeout به 45 ثانیه
                     });
 
-                    // Check if page is still open
+                    // بررسی اینکه page هنوز باز است
                     if (page.isClosed()) {
                         throw new Error("Page was closed after goto");
                     }
@@ -161,7 +246,7 @@ export default class AccountProcessor {
                     throw new Error('PAGE_LOAD_FAILED');
                 }
 
-                // Increase delay between attempts
+                // افزایش تأخیر بین تلاش‌ها
                 await HumanBehavior.sleep(5000 * attempt + HumanBehavior.randomDelay(1000, 2000));
             }
         }
@@ -251,8 +336,12 @@ export default class AccountProcessor {
             bodyText = await page.evaluate(() => document.body?.innerText || "");
         }
 
-        if (await PageHelpers._hasTimeoutMessage(bodyText) && accountsCount === tabIndex + 1) {
-            logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected for ${email}`);
+        const hasTimeoutMessage = await PageHelpers._hasTimeoutMessage(bodyText);
+        logger.info(`🔍 Tab ${tabIndex + 1}: Debug - hasTimeoutMessage: ${hasTimeoutMessage}, tabIndex: ${tabIndex + 1}, accountsCount: ${accountsCount}`);
+        logger.info(`🔍 Tab ${tabIndex + 1}: Body text contains: ${bodyText.substring(0, 200)}...`);
+
+        if (hasTimeoutMessage && accountsCount === tabIndex + 1) {
+            logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected on LAST account for ${email} - Should exit now!`);
 
             return {
                 shouldExit: true,
@@ -307,6 +396,8 @@ export default class AccountProcessor {
     }
 
     _determineLoginStatus(bodyText) {
+        console.log('zzz   ', bodyText);
+
         const statusChecks = [
             { text: 'A verification code has been sent to your', status: 'good' },
             { text: 'Two-factor authentication', status: '2fa' },
@@ -449,7 +540,7 @@ export default class AccountProcessor {
 
             const logData = JSON.stringify(logEntry) + '\n';
 
-            // Use appendFile to add to end of file
+            // استفاده از appendFile برای اضافه کردن به انتهای فایل
             await fs.appendFile(Constants.RESULTS_FILE, logData, 'utf8');
 
         } catch (error) {
