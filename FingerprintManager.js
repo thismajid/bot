@@ -1,35 +1,35 @@
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
-import path from "node:path";
 
-const FINGERPRINT_QUEUE_FILE = "fingerprint_queue.json";
-const FINGERPRINT_STATS_FILE = "fingerprint_stats.json";
+// ==================== Constants ====================
+const FILES = {
+    QUEUE: "fingerprint_queue.json",
+    STATS: "fingerprint_stats.json"
+};
 
-// ساختار داده برای مدیریت صف فینگرپرینت‌ها
+const FINGERPRINT_CONFIG = {
+    OS_VERSION: '10',
+    DEVICE_TYPE: 'desktop',
+    OS_TYPE: 'windows',
+    BROWSER: 'chrome'
+};
+
+// ==================== FingerprintManager Class ====================
 export default class FingerprintManager {
     constructor(kameleoClient) {
-        this.client = kameleoClient; // اضافه کردن client به کلاس
+        this.client = kameleoClient;
         this.queue = [];
         this.currentIndex = 0;
         this.stats = {};
     }
 
-    // بارگذاری وضعیت از فایل
+    // ==================== State Management ====================
     async loadState() {
         try {
-            // بارگذاری صف
-            if (fsSync.existsSync(FINGERPRINT_QUEUE_FILE)) {
-                const queueData = await fs.readFile(FINGERPRINT_QUEUE_FILE, "utf8");
-                const parsed = JSON.parse(queueData);
-                this.queue = parsed.queue || [];
-                this.currentIndex = parsed.currentIndex || 0;
-            }
-
-            // بارگذاری آمار
-            if (fsSync.existsSync(FINGERPRINT_STATS_FILE)) {
-                const statsData = await fs.readFile(FINGERPRINT_STATS_FILE, "utf8");
-                this.stats = JSON.parse(statsData);
-            }
+            await Promise.all([
+                this._loadQueue(),
+                this._loadStats()
+            ]);
 
             console.log(`📊 Loaded ${this.queue.length} fingerprints, current index: ${this.currentIndex}`);
             
@@ -39,7 +39,22 @@ export default class FingerprintManager {
         }
     }
 
-    // ذخیره وضعیت در فایل
+    async _loadQueue() {
+        if (fsSync.existsSync(FILES.QUEUE)) {
+            const queueData = await fs.readFile(FILES.QUEUE, "utf8");
+            const parsed = JSON.parse(queueData);
+            this.queue = parsed.queue || [];
+            this.currentIndex = parsed.currentIndex || 0;
+        }
+    }
+
+    async _loadStats() {
+        if (fsSync.existsSync(FILES.STATS)) {
+            const statsData = await fs.readFile(FILES.STATS, "utf8");
+            this.stats = JSON.parse(statsData);
+        }
+    }
+
     async saveState() {
         try {
             const queueData = {
@@ -48,42 +63,31 @@ export default class FingerprintManager {
                 lastUpdated: new Date().toISOString()
             };
 
-            await fs.writeFile(FINGERPRINT_QUEUE_FILE, JSON.stringify(queueData, null, 2), "utf8");
-            await fs.writeFile(FINGERPRINT_STATS_FILE, JSON.stringify(this.stats, null, 2), "utf8");
+            await Promise.all([
+                fs.writeFile(FILES.QUEUE, JSON.stringify(queueData, null, 2), "utf8"),
+                fs.writeFile(FILES.STATS, JSON.stringify(this.stats, null, 2), "utf8")
+            ]);
 
         } catch (err) {
             console.log("Error saving fingerprint state:", err.message);
         }
     }
 
-    // مقداردهی اولیه صف با فینگرپرینت‌های جدید
+    // ==================== Queue Initialization ====================
     async initializeQueue() {
         try {
             console.log("🔄 Initializing fingerprint queue...");
             
-            // استفاده از this.client به جای client
-            const fingerprints = await this.client.fingerprint.searchFingerprints("desktop", "windows", "chrome");
-            const windowsFingerprints = fingerprints.filter(item => item.os.version === '10');
+            const fingerprints = await this._fetchFingerprints();
+            const filteredFingerprints = this._filterFingerprints(fingerprints);
             
-            // مخلوط کردن فینگرپرینت‌ها برای توزیع بهتر
-            this.queue = this.shuffleArray([...windowsFingerprints]);
+            this.queue = this._shuffleArray([...filteredFingerprints]);
             this.currentIndex = 0;
             this.stats = {};
 
-            // مقداردهی آمار
-            this.queue.forEach(fp => {
-                this.stats[fp.id] = {
-                    usageCount: 0,
-                    lastUsed: null,
-                    fingerprintInfo: {
-                        userAgent: fp.userAgent,
-                        screen: fp.screen,
-                        language: fp.language
-                    }
-                };
-            });
-
+            this._initializeStats();
             await this.saveState();
+            
             console.log(`✅ Initialized queue with ${this.queue.length} fingerprints`);
 
         } catch (err) {
@@ -92,8 +96,34 @@ export default class FingerprintManager {
         }
     }
 
-    // مخلوط کردن آرایه (Fisher-Yates shuffle)
-    shuffleArray(array) {
+    async _fetchFingerprints() {
+        return await this.client.fingerprint.searchFingerprints(
+            FINGERPRINT_CONFIG.DEVICE_TYPE,
+            FINGERPRINT_CONFIG.OS_TYPE,
+            FINGERPRINT_CONFIG.BROWSER
+        );
+    }
+
+    _filterFingerprints(fingerprints) {
+        return fingerprints.filter(item => item.os.version === FINGERPRINT_CONFIG.OS_VERSION);
+    }
+
+    _initializeStats() {
+        this.queue.forEach(fp => {
+            this.stats[fp.id] = {
+                usageCount: 0,
+                lastUsed: null,
+                fingerprintInfo: {
+                    userAgent: fp.userAgent,
+                    screen: fp.screen,
+                    language: fp.language
+                }
+            };
+        });
+    }
+
+    // ==================== Utility Methods ====================
+    _shuffleArray(array) {
         const shuffled = [...array];
         for (let i = shuffled.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
@@ -102,7 +132,7 @@ export default class FingerprintManager {
         return shuffled;
     }
 
-    // گرفتن فینگرپرینت بعدی از صف
+    // ==================== Main Queue Operations ====================
     async getNextFingerprint() {
         try {
             await this.loadState();
@@ -111,30 +141,15 @@ export default class FingerprintManager {
                 await this.initializeQueue();
             }
 
-            // اگر به انتهای صف رسیدیم، از اول شروع کن
-            if (this.currentIndex >= this.queue.length) {
-                console.log("🔄 Reached end of queue, restarting from beginning...");
-                this.currentIndex = 0;
-                
-                // مخلوط کردن مجدد برای تنوع بیشتر
-                this.queue = this.shuffleArray(this.queue);
-                console.log("🔀 Queue reshuffled for next round");
-            }
-
-            const selectedFingerprint = this.queue[this.currentIndex];
+            this._handleQueueRotation();
             
-            // به‌روزرسانی آمار
-            this.stats[selectedFingerprint.id].usageCount++;
-            this.stats[selectedFingerprint.id].lastUsed = new Date().toISOString();
-
-            // حرکت به فینگرپرینت بعدی
+            const selectedFingerprint = this.queue[this.currentIndex];
+            this._updateFingerprintStats(selectedFingerprint);
+            
             this.currentIndex++;
-
             await this.saveState();
 
-            console.log(`🎯 Selected fingerprint ${this.currentIndex}/${this.queue.length}: ${selectedFingerprint.id}`);
-            console.log(`📊 Usage count: ${this.stats[selectedFingerprint.id].usageCount}`);
-
+            this._logFingerprintSelection(selectedFingerprint);
             return selectedFingerprint;
 
         } catch (err) {
@@ -143,16 +158,44 @@ export default class FingerprintManager {
         }
     }
 
-    // نمایش آمار استفاده
+    _handleQueueRotation() {
+        if (this.currentIndex >= this.queue.length) {
+            console.log("🔄 Reached end of queue, restarting from beginning...");
+            this.currentIndex = 0;
+            
+            this.queue = this._shuffleArray(this.queue);
+            console.log("🔀 Queue reshuffled for next round");
+        }
+    }
+
+    _updateFingerprintStats(fingerprint) {
+        this.stats[fingerprint.id].usageCount++;
+        this.stats[fingerprint.id].lastUsed = new Date().toISOString();
+    }
+
+    _logFingerprintSelection(fingerprint) {
+        console.log(`🎯 Selected fingerprint ${this.currentIndex}/${this.queue.length}: ${fingerprint.id}`);
+        console.log(`📊 Usage count: ${this.stats[fingerprint.id].usageCount}`);
+    }
+
+    // ==================== Statistics and Management ====================
     async showStats() {
         await this.loadState();
         
         console.log("\n📊 Fingerprint Usage Statistics:");
         console.log("=".repeat(50));
 
-        const sortedStats = Object.entries(this.stats)
-            .sort(([,a], [,b]) => b.usageCount - a.usageCount);
+        const sortedStats = this._getSortedStats();
+        this._displayStatsTable(sortedStats);
+        this._displayStatsSummary(sortedStats);
+    }
 
+    _getSortedStats() {
+        return Object.entries(this.stats)
+            .sort(([,a], [,b]) => b.usageCount - a.usageCount);
+    }
+
+    _displayStatsTable(sortedStats) {
         sortedStats.forEach(([fingerprintId, stats], index) => {
             const lastUsed = stats.lastUsed ? 
                 new Date(stats.lastUsed).toLocaleString('fa-IR') : 
@@ -160,7 +203,9 @@ export default class FingerprintManager {
             
             console.log(`${index + 1}. ID: ${fingerprintId.substring(0, 8)}... | Uses: ${stats.usageCount} | Last: ${lastUsed}`);
         });
+    }
 
+    _displayStatsSummary(sortedStats) {
         const totalUsage = sortedStats.reduce((sum, [,stats]) => sum + stats.usageCount, 0);
         const avgUsage = totalUsage / sortedStats.length;
         
@@ -171,16 +216,11 @@ export default class FingerprintManager {
         console.log(`Current queue position: ${this.currentIndex}/${this.queue.length}`);
     }
 
-    // ریست کردن آمار (اختیاری)
     async resetStats() {
         try {
-            Object.keys(this.stats).forEach(fpId => {
-                this.stats[fpId].usageCount = 0;
-                this.stats[fpId].lastUsed = null;
-            });
-
+            this._resetAllStats();
             this.currentIndex = 0;
-            this.queue = this.shuffleArray(this.queue);
+            this.queue = this._shuffleArray(this.queue);
 
             await this.saveState();
             console.log("✅ Fingerprint stats reset successfully");
@@ -190,26 +230,45 @@ export default class FingerprintManager {
         }
     }
 
-    // بررسی تعادل استفاده
+    _resetAllStats() {
+        Object.keys(this.stats).forEach(fpId => {
+            this.stats[fpId].usageCount = 0;
+            this.stats[fpId].lastUsed = null;
+        });
+    }
+
     async checkBalance() {
         await this.loadState();
         
+        const balanceInfo = this._calculateBalance();
+        this._displayBalanceInfo(balanceInfo);
+        
+        return balanceInfo;
+    }
+
+    _calculateBalance() {
         const usageCounts = Object.values(this.stats).map(s => s.usageCount);
         const minUsage = Math.min(...usageCounts);
         const maxUsage = Math.max(...usageCounts);
         const difference = maxUsage - minUsage;
 
+        return { 
+            minUsage, 
+            maxUsage, 
+            difference, 
+            isBalanced: difference <= 1 
+        };
+    }
+
+    _displayBalanceInfo({ minUsage, maxUsage, difference, isBalanced }) {
         console.log(`⚖️ Usage balance: Min=${minUsage}, Max=${maxUsage}, Difference=${difference}`);
         
-        if (difference <= 1) {
+        if (isBalanced) {
             console.log("✅ Perfect balance achieved!");
         } else if (difference <= 3) {
             console.log("✅ Good balance");
         } else {
             console.log("⚠️ Imbalanced usage detected");
         }
-
-        return { minUsage, maxUsage, difference, isBalanced: difference <= 1 };
     }
 }
-
