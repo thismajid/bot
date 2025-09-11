@@ -10,14 +10,9 @@ const __dirname = dirname(__filename);
 // ==================== Utility Functions ====================
 function resolvePwBridgePath() {
     if (process.env.PW_BRIDGE_PATH) return process.env.PW_BRIDGE_PATH;
-    
-    const paths = {
-        win32: `${process.env.LOCALAPPDATA}\\Programs\\Kameleo\\pw-bridge.exe`,
-        darwin: "/Applications/Kameleo.app/Contents/Resources/CLI/pw-bridge",
-        default: "/opt/kameleo/pw-bridge"
-    };
-    
-    return paths[process.platform] || paths.default;
+    if (process.platform === "win32") return `${process.env.LOCALAPPDATA}\\Programs\\Kameleo\\pw-bridge.exe`;
+    if (process.platform === "darwin") return "/Applications/Kameleo.app/Contents/Resources/CLI/pw-bridge";
+    return "/opt/kameleo/pw-bridge";
 }
 
 // ==================== ProfileManager Class ====================
@@ -128,7 +123,7 @@ export default class ProfileManager {
             executablePath: pwBridgePath,
             args: ['--window-size=1920,1080', `-target ${ws}`],
             viewport: { width: 1920, height: 1080 },
-            timeout: Constants.PROFILE_CREATE_TIMEOUT,
+            timeout: 25000,
             headless: true,
             chromiumSandbox: false,
             devtools: false
@@ -185,9 +180,9 @@ export default class ProfileManager {
 
     _shouldRetryForBrowserLimit(err, retryCount) {
         return (err.message.includes('Concurrent browsers limit exceeded') ||
-                err.message.includes('HTTP 402') ||
-                err.message.includes('Global browser limit exceeded')) &&
-               retryCount < this.maxRetries;
+            err.message.includes('HTTP 402') ||
+            err.message.includes('Global browser limit exceeded')) &&
+            retryCount < this.maxRetries;
     }
 
     async _retryForBrowserLimit(proxy, cookies, retryCount) {
@@ -198,9 +193,9 @@ export default class ProfileManager {
     }
 
     _shouldRetryForTimeout(err, retryCount) {
-        return err.message.includes('Timeout') && 
-               err.message.includes('exceeded') && 
-               retryCount < this.maxRetries;
+        return err.message.includes('Timeout') &&
+            err.message.includes('exceeded') &&
+            retryCount < this.maxRetries;
     }
 
     async _retryForTimeout(proxy, cookies, retryCount) {
@@ -211,11 +206,11 @@ export default class ProfileManager {
     }
 
     _shouldRetryForProxy(err, proxy, retryCount) {
-        return proxy && 
-               (err.message.includes('Failed to determine external IP address') ||
+        return proxy &&
+            (err.message.includes('Failed to determine external IP address') ||
                 err.message.includes('HTTP 503') ||
                 err.message.includes('connection')) &&
-               retryCount < this.maxRetries;
+            retryCount < this.maxRetries;
     }
 
     async _retryForProxy(cookies, retryCount) {
@@ -264,7 +259,7 @@ export default class ProfileManager {
             for (const profile of profiles) {
                 try {
                     const profileAge = this._calculateProfileAge(profile, activeProfiles, currentTime);
-                    
+
                     if (profileAge > fiveMinutesInMs) {
                         const result = await this._cleanupSingleProfile(profile, activeProfiles, profileAge);
                         stoppedCount += result.stopped;
@@ -281,7 +276,7 @@ export default class ProfileManager {
 
             const cleanedClusters = await this.globalBrowserManager.cleanupDeadClusters();
             const stats = await this.globalBrowserManager.getClusterStats();
-            
+
             console.log(`✅ Global cleanup completed: ${stoppedCount} stopped, ${deletedCount} deleted, ${cleanedClusters} dead clusters cleaned`);
             console.log(`📊 Global stats:`, stats);
 
@@ -306,7 +301,7 @@ export default class ProfileManager {
 
     _calculateProfileAge(profile, activeProfiles, currentTime) {
         const registeredProfile = activeProfiles[profile.id];
-        
+
         if (registeredProfile) {
             return currentTime - registeredProfile.createdAt;
         }
@@ -322,7 +317,7 @@ export default class ProfileManager {
     async _cleanupSingleProfile(profile, activeProfiles, profileAge) {
         const ageInMinutes = Math.round(profileAge / 60000);
         const ownerCluster = activeProfiles[profile.id]?.clusterId || 'unknown';
-        
+
         console.log(`🕒 Profile ${profile.name} is ${ageInMinutes} minutes old (Owner: Cluster ${ownerCluster}), cleaning up...`);
 
         let stopped = 0;
