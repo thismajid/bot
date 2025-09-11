@@ -1,3 +1,4 @@
+import path from "node:path";
 import HumanBehavior from "./HumanBehavior.js";
 import Constants from "./Constants.js";
 
@@ -107,7 +108,7 @@ export default class PageHelpers {
     static _hasTimeoutMessage(pageContent) {
         const timeoutMessages = [
             'The connection to the server timed out.',
-            'Can\'t connect to the server',
+            'connect to the server',
             'device sent too many requests'
         ];
         
